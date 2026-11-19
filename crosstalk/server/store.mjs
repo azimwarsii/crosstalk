@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-const MIGRATIONS = [
+export const MIGRATIONS = [
   `CREATE TABLE users (
      id TEXT PRIMARY KEY,
      handle TEXT NOT NULL UNIQUE,
@@ -69,6 +69,27 @@ const MIGRATIONS = [
    );
    CREATE INDEX messages_room ON messages(room_id, seq);
    CREATE INDEX messages_reply ON messages(reply_to);`,
+  // 2: teams (workspaces). Rooms and DMs belong to a team; room names are unique per team.
+  `CREATE TABLE teams (
+     id TEXT PRIMARY KEY,
+     name TEXT NOT NULL,
+     slug TEXT NOT NULL UNIQUE,
+     visibility TEXT NOT NULL DEFAULT 'invite',
+     invite_code TEXT NOT NULL UNIQUE,
+     created_by TEXT,
+     created_at INTEGER NOT NULL
+   );
+   CREATE TABLE team_members (
+     team_id TEXT NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+     role TEXT NOT NULL DEFAULT 'member',
+     joined_at INTEGER NOT NULL,
+     PRIMARY KEY (team_id, user_id)
+   );
+   CREATE INDEX team_members_by_user ON team_members(user_id);
+   ALTER TABLE rooms ADD COLUMN team_id TEXT;
+   DROP INDEX rooms_slug;
+   CREATE UNIQUE INDEX rooms_team_slug ON rooms(team_id, slug) WHERE kind = 'room';`,
 ];
 
 const userFromRow = (r) => ({
@@ -148,10 +169,17 @@ export function createStore(file = ':memory:') {
         last_connected_at=excluded.last_connected_at, last_seen_at=excluded.last_seen_at, bridge_json=excluded.bridge_json`),
     deleteAgent: q('DELETE FROM agents WHERE id = ?'),
     deleteAgentMemberships: q("DELETE FROM members WHERE kind = 'agent' AND member_id = ?"),
-    upsertRoom: q(`INSERT INTO rooms (id, name, slug, topic, kind, visibility, dm_key, created_by, created_at, last_message_at)
-      VALUES (:id, :name, :slug, :topic, :kind, :visibility, :dmKey, :createdBy, :createdAt, :lastMessageAt)
+    upsertRoom: q(`INSERT INTO rooms (id, name, slug, topic, kind, visibility, dm_key, created_by, created_at, last_message_at, team_id)
+      VALUES (:id, :name, :slug, :topic, :kind, :visibility, :dmKey, :createdBy, :createdAt, :lastMessageAt, :teamId)
       ON CONFLICT(id) DO UPDATE SET name=excluded.name, slug=excluded.slug, topic=excluded.topic, visibility=excluded.visibility,
-        last_message_at=excluded.last_message_at`),
+        dm_key=excluded.dm_key, last_message_at=excluded.last_message_at, team_id=excluded.team_id`),
+    upsertTeam: q(`INSERT INTO teams (id, name, slug, visibility, invite_code, created_by, created_at)
+      VALUES (:id, :name, :slug, :visibility, :inviteCode, :createdBy, :createdAt)
+      ON CONFLICT(id) DO UPDATE SET name=excluded.name, visibility=excluded.visibility, invite_code=excluded.invite_code`),
+    addTeamMember: q('INSERT INTO team_members (team_id, user_id, role, joined_at) VALUES (?, ?, ?, ?) ON CONFLICT(team_id, user_id) DO UPDATE SET role=excluded.role'),
+    removeTeamMember: q('DELETE FROM team_members WHERE team_id = ? AND user_id = ?'),
+    deleteTeamRooms: q('DELETE FROM rooms WHERE team_id = ?'),
+    deleteTeam: q('DELETE FROM teams WHERE id = ?'),
     addMember: q('INSERT OR IGNORE INTO members (room_id, kind, member_id, joined_at) VALUES (?, ?, ?, ?)'),
     removeMember: q('DELETE FROM members WHERE room_id = ? AND kind = ? AND member_id = ?'),
     insertMessage: q(`INSERT INTO messages (id, room_id, sender_kind, sender_id, text, mentions_json, reply_to, depth, created_at)
@@ -192,9 +220,25 @@ export function createStore(file = ':memory:') {
       createdBy: r.created_by ?? null,
       createdAt: r.created_at,
       lastMessageAt: r.last_message_at ?? null,
+      teamId: r.team_id ?? null,
       members: byRoom.get(r.id) ?? [],
     }));
-    return { users, agents, rooms };
+    const byTeam = new Map();
+    for (const m of q('SELECT * FROM team_members ORDER BY joined_at').all()) {
+      if (!byTeam.has(m.team_id)) byTeam.set(m.team_id, new Map());
+      byTeam.get(m.team_id).set(m.user_id, { role: m.role, joinedAt: m.joined_at });
+    }
+    const teams = q('SELECT * FROM teams').all().map((t) => ({
+      id: t.id,
+      name: t.name,
+      slug: t.slug,
+      visibility: t.visibility,
+      inviteCode: t.invite_code,
+      createdBy: t.created_by ?? null,
+      createdAt: t.created_at,
+      members: byTeam.get(t.id) ?? new Map(),
+    }));
+    return { users, agents, rooms, teams };
   }
 
   return {
@@ -222,7 +266,28 @@ export function createStore(file = ':memory:') {
       }
     },
     saveRoom(r) {
-      stmt.upsertRoom.run({ id: r.id, name: r.name, slug: r.slug, topic: r.topic ?? '', kind: r.kind, visibility: r.visibility, dmKey: r.dmKey ?? null, createdBy: r.createdBy ?? null, createdAt: r.createdAt, lastMessageAt: r.lastMessageAt ?? null });
+      stmt.upsertRoom.run({ id: r.id, name: r.name, slug: r.slug, topic: r.topic ?? '', kind: r.kind, visibility: r.visibility, dmKey: r.dmKey ?? null, createdBy: r.createdBy ?? null, createdAt: r.createdAt, lastMessageAt: r.lastMessageAt ?? null, teamId: r.teamId ?? null });
+    },
+    saveTeam(t) {
+      stmt.upsertTeam.run({ id: t.id, name: t.name, slug: t.slug, visibility: t.visibility, inviteCode: t.inviteCode, createdBy: t.createdBy ?? null, createdAt: t.createdAt });
+    },
+    addTeamMember(teamId, userId, role, at) {
+      stmt.addTeamMember.run(teamId, userId, role, at);
+    },
+    removeTeamMember(teamId, userId) {
+      stmt.removeTeamMember.run(teamId, userId);
+    },
+    /** Deletes the team with its rooms, DMs, messages and memberships (foreign keys cascade). */
+    deleteTeam(teamId) {
+      db.exec('BEGIN');
+      try {
+        stmt.deleteTeamRooms.run(teamId);
+        stmt.deleteTeam.run(teamId);
+        db.exec('COMMIT');
+      } catch (e) {
+        db.exec('ROLLBACK');
+        throw e;
+      }
     },
     addMember(roomId, kind, id, at) {
       stmt.addMember.run(roomId, kind, id, at);

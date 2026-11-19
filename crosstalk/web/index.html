@@ -37,6 +37,53 @@
     </section>
   </div>
 
+  <!-- Pick a team (first sign-in), or accept an invite link -->
+  <div id="onboard" class="onboard" hidden>
+    <div class="onboard-card">
+      <div class="brand"><span class="logo" aria-hidden="true"></span>Crosstalk</div>
+      <section id="onboard-invite" class="ob-invite" hidden>
+        <span id="invite-tile"></span>
+        <p class="muted">You’ve been invited to join</p>
+        <h1 id="invite-team-name"></h1>
+        <p class="muted" id="invite-team-meta"></p>
+        <p class="error" id="invite-error" role="alert"></p>
+        <div class="ob-actions"><button class="btn" type="button" id="invite-skip">Not now</button><button class="solid" type="button" id="invite-accept">Join team</button></div>
+      </section>
+      <section id="onboard-main">
+        <h1>Join or create a team</h1>
+        <p class="muted">A team is where you talk with people and their agents. Everyone in a team sees its people, rooms and shared agents; nobody outside it does.</p>
+        <div id="onboard-forms"></div>
+      </section>
+      <div class="ob-foot"><span id="onboard-me" class="muted small"></span><button class="link-btn" type="button" id="onboard-signout">Sign out</button></div>
+    </div>
+  </div>
+
+  <!-- Create or join a team (moved between the onboarding card and the dialog) -->
+  <div id="team-forms-home" hidden><div id="team-forms" class="team-forms">
+    <div class="tabs" role="tablist">
+      <button type="button" role="tab" data-team-tab="create" class="on">Create a team</button>
+      <button type="button" role="tab" data-team-tab="join">Join a team</button>
+    </div>
+    <form id="form-team-create" class="tf-pane" data-pane="create">
+      <label>Team name<input name="name" required maxlength="48" placeholder="Acme Design" autocomplete="organization"></label>
+      <label>Who can join
+        <select name="visibility">
+          <option value="invite">Only people with the invite link</option>
+          <option value="open">Anyone signed in to this hub can find it</option>
+        </select>
+      </label>
+      <p class="muted small">It comes with a #general room and an invite link to share.</p>
+      <p class="error" data-error></p>
+      <div class="dlg-actions"><button class="btn" type="button" data-close data-dlg-only>Cancel</button><button class="solid" type="submit">Create team</button></div>
+    </form>
+    <form id="form-team-join" class="tf-pane" data-pane="join" hidden>
+      <label>Invite link or code<input name="code" required placeholder="Paste the link someone sent you" autocomplete="off"></label>
+      <p class="error" data-error></p>
+      <div class="dlg-actions"><button class="btn" type="button" data-close data-dlg-only>Cancel</button><button class="solid" type="submit">Join</button></div>
+      <section id="open-teams-section" class="open-teams" hidden><h3>Or join an open team</h3><ul class="picker" id="open-teams"></ul></section>
+    </form>
+  </div></div>
+
   <!-- App -->
   <div id="app" class="shell" hidden>
     <nav class="rail" aria-label="Workspace">
@@ -57,7 +104,7 @@
     <div class="app-card">
       <aside id="sidebar" class="sidebar" aria-label="Rooms and agents">
         <header class="side-head">
-          <button class="ws-switch" id="ws-switch" type="button" aria-haspopup="menu"><span id="ws-name">Crosstalk</span><svg class="i" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></button>
+          <button class="ws-switch" id="ws-switch" type="button" aria-haspopup="menu" title="Switch team"><span id="ws-tile"></span><span id="ws-name">Crosstalk</span><svg class="i" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></button>
           <div class="side-head-actions">
             <button class="icon-btn sm" id="btn-back" type="button" title="Back (⌘[)" aria-label="Back to the previous room" data-icon="chevronLeft" disabled></button>
             <button class="icon-btn sm" id="btn-forward" type="button" title="Forward (⌘])" aria-label="Forward" data-icon="chevronRight" disabled></button>
@@ -171,7 +218,7 @@
       <label>Topic<input name="topic" maxlength="200" placeholder="What is this room for?"></label>
       <label data-only="new">Who can join
         <select name="visibility">
-          <option value="public">Anyone on this hub</option>
+          <option value="public">Anyone in the team</option>
           <option value="private">Invite only</option>
         </select>
       </label>
@@ -197,7 +244,7 @@
       <label>What it’s good at<input name="description" maxlength="280" placeholder="Knows our backend repo; reviews PRs"></label>
       <label>Who can talk to it
         <select name="visibility">
-          <option value="public">Anyone on this hub</option>
+          <option value="public">People in my teams</option>
           <option value="private">Only me</option>
         </select>
       </label>
@@ -221,12 +268,48 @@
   <!-- Invite people -->
   <dialog id="dlg-invite">
     <div class="dlg">
-      <h2>Invite people</h2>
-      <p class="muted">Send them this link. They sign in with Google and show up under People. Then you can message them or add them to rooms.</p>
+      <h2 id="invite-title">Invite people</h2>
+      <p class="muted" id="invite-intro">Send them this link. They sign in with Google, join the team, and show up under People.</p>
       <div class="kv"><code id="invite-link" class="copyable"></code><button class="btn sm" type="button" data-copy="#invite-link">Copy link</button></div>
       <div id="invite-local" class="banner warn small" hidden></div>
       <label>Or copy a ready-made invite<textarea id="invite-text" rows="3" readonly></textarea></label>
       <div class="dlg-actions"><button class="btn" type="button" id="btn-copy-invite">Copy invite</button><button class="solid" type="button" data-close>Done</button></div>
+    </div>
+  </dialog>
+
+  <!-- Create or join a team -->
+  <dialog id="dlg-team">
+    <div class="dlg" id="dlg-team-body"><h2>Teams</h2></div>
+  </dialog>
+
+  <!-- Team settings -->
+  <dialog id="dlg-team-settings">
+    <div class="dlg">
+      <h2 id="ts-title">Team settings</h2>
+      <form id="form-team-settings" class="ts-form">
+        <label>Team name<input name="name" required maxlength="48"></label>
+        <label>Who can join
+          <select name="visibility">
+            <option value="invite">Only people with the invite link</option>
+            <option value="open">Anyone signed in to this hub can find it</option>
+          </select>
+        </label>
+        <p class="error" data-error></p>
+        <div class="dlg-actions" data-owner-only><button class="solid" type="submit">Save</button></div>
+      </form>
+      <section class="ts-section">
+        <h3>Invite link</h3>
+        <div class="kv"><code id="ts-link" class="copyable"></code><button class="btn sm" type="button" data-copy="#ts-link">Copy</button></div>
+        <p class="muted small">Anyone with this link can join. <button class="link-btn" type="button" id="ts-reset" data-owner-only>Reset it</button></p>
+      </section>
+      <section class="ts-section">
+        <h3 id="ts-members-title">Members</h3>
+        <ul class="picker" id="ts-members"></ul>
+      </section>
+      <div class="dlg-actions spread">
+        <span><button class="btn danger" type="button" id="ts-leave">Leave team</button> <button class="btn danger" type="button" id="ts-delete" data-owner-only>Delete team</button></span>
+        <button class="solid" type="button" data-close>Done</button>
+      </div>
     </div>
   </dialog>
 

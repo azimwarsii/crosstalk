@@ -100,7 +100,8 @@ test('Clerk session tokens sign people in; bad tokens are refused', async (t) =>
   assert.equal(me.imageUrl, 'https://img.clerk.com/ada.png');
   assert.equal(userLookups, 1);
   const rooms = await (await get('/api/rooms', token)).json();
-  assert.ok(rooms.rooms.some((r) => r.slug === 'general'), 'new people land in #general');
+  assert.deepEqual(rooms.rooms, [], 'new people start with no team, so no rooms');
+  assert.deepEqual(me.teams, []);
 
   // Refused: expired, wrong instance, wrong site, forged signature, unknown key, garbage.
   const refused = {

@@ -72,6 +72,10 @@ export function createHub({
   }
   const memberKeys = new Map(); // roomId -> Set("kind:id")
   for (const r of rooms.values()) memberKeys.set(r.id, new Set(r.members.map((m) => `${m.kind}:${m.id}`)));
+  // Teams (workspaces): every room and DM belongs to one. People only see the people, rooms
+  // and public agents of the teams they are in.
+  const teams = new Map(loaded.teams.map((t) => [t.id, t])); // t.members: Map userId -> {role, joinedAt}
+  const teamCodes = new Map([...teams.values()].map((t) => [t.inviteCode, t.id])); // invite code -> teamId
 
   /** key "user:<id>" | "agent:<id>" -> Set<{send, close}> */
   const conns = new Map();
@@ -94,6 +98,12 @@ export function createHub({
   const handleTaken = (h) => RESERVED.has(h) || handles.has(h);
   const isOnline = (agentId) => (conns.get(pkey('agent', agentId))?.size ?? 0) > 0;
   const isMember = (room, kind, id) => memberKeys.get(room.id)?.has(`${kind}:${id}`) ?? false;
+  const isTeamMember = (teamId, userId) => (teamId ? (teams.get(teamId)?.members.has(userId) ?? false) : false);
+  const teamsOf = (userId) => [...teams.values()].filter((t) => t.members.has(userId));
+  /** Do these two people have a team in common? (Everyone shares a team with themself.) */
+  const sharesTeam = (a, b) => a === b || [...teams.values()].some((t) => t.members.has(a) && t.members.has(b));
+  /** Whose agent this principal acts for: the person, or the agent's owner. */
+  const actingUserId = (p) => (p.kind === 'user' ? p.id : p.agent?.ownerId);
 
   function addMemberTo(room, kind, id) {
     if (isMember(room, kind, id)) return false;
@@ -157,6 +167,7 @@ export function createHub({
   }
   const roomView = (r) => ({
     id: r.id,
+    teamId: r.teamId ?? null,
     name: r.name,
     slug: r.slug,
     topic: r.topic,
@@ -189,12 +200,17 @@ export function createHub({
   const sendToUser = (userId, evt) => {
     for (const c of conns.get(pkey('user', userId)) ?? []) c.send(evt);
   };
-  const roomAudience = (room) => (uid) =>
-    isMember(room, 'user', uid) || (room.kind === 'room' && room.visibility === 'public');
+  const roomAudience = (room) => (uid) => canRead({ kind: 'user', id: uid }, room);
   const broadcastRoom = (room, evt) => broadcastUsers(evt, roomAudience(room));
   const broadcastRoomUpdate = (room) => broadcastRoom(room, { type: 'room', room: roomView(room) });
+  const broadcastTeammates = (userId, evt) => broadcastUsers(evt, (uid) => sharesTeam(uid, userId));
+  const broadcastTeam = (t, evt) => {
+    for (const uid of t.members.keys()) sendToUser(uid, evt);
+  };
   function broadcastAgent(a) {
-    broadcastUsers({ type: 'agent', agent: agentView(a) }, (uid) => uid !== a.ownerId && a.visibility === 'public');
+    // Teammates see public agents; a private one disappears from their lists.
+    const evt = a.visibility === 'public' ? { type: 'agent', agent: agentView(a) } : { type: 'agent_removed', agentId: a.id };
+    broadcastUsers(evt, (uid) => uid !== a.ownerId && sharesTeam(uid, a.ownerId));
     sendToUser(a.ownerId, { type: 'agent', agent: agentView(a, a.ownerId) });
   }
 
@@ -220,29 +236,243 @@ export function createHub({
     if (!r) throw new HubError(404, 'Room not found');
     return r;
   }
+  /**
+   * Agents read the rooms they are in. People read rooms they are in and the public rooms
+   * of their teams, and lose access to a team's rooms and DMs when they leave the team.
+   */
   function canRead(p, r) {
-    return isMember(r, p.kind, p.id) || (p.kind === 'user' && r.kind === 'room' && r.visibility === 'public');
+    if (p.kind === 'agent') return isMember(r, 'agent', p.id);
+    if (!r.teamId) return isMember(r, 'user', p.id);
+    if (!isTeamMember(r.teamId, p.id)) return false;
+    return isMember(r, 'user', p.id) || (r.kind === 'room' && r.visibility === 'public');
   }
   function me(p) {
     if (p.kind === 'user') {
-      return { ...userView(p.user), email: p.user.email ?? null, agents: [...agents.values()].filter((a) => a.ownerId === p.id).map((a) => agentView(a, p.id)) };
+      return {
+        ...userView(p.user),
+        email: p.user.email ?? null,
+        agents: [...agents.values()].filter((a) => a.ownerId === p.id).map((a) => agentView(a, p.id)),
+        teams: listTeams(p),
+      };
     }
     return agentView(p.agent, p.agent.ownerId);
   }
 
-  // ---------- people ----------
-  function defaultRoom() {
-    let room = [...rooms.values()].find((r) => r.kind === 'room' && r.slug === DEFAULT_ROOM.slug);
-    if (!room) {
-      room = { id: newId('room'), name: DEFAULT_ROOM.slug, slug: DEFAULT_ROOM.slug, topic: DEFAULT_ROOM.topic, kind: 'room', visibility: 'public', dmKey: null, createdBy: null, createdAt: now(), lastMessageAt: null, members: [] };
-      rooms.set(room.id, room);
-      memberKeys.set(room.id, new Set());
-      store.saveRoom(room);
-    }
+  // ---------- teams ----------
+  const MAX_TEAMS_CREATED = 20;
+  const newInviteCode = () => crypto.randomBytes(9).toString('base64url');
+  const online = (uid) => (conns.get(pkey('user', uid))?.size ?? 0) > 0;
+
+  function teamView(t, viewerId = null) {
+    const m = viewerId ? t.members.get(viewerId) : null;
+    const view = { id: t.id, name: t.name, slug: t.slug, visibility: t.visibility, memberCount: t.members.size, createdAt: t.createdAt, role: m?.role ?? null };
+    if (m) Object.assign(view, { inviteCode: t.inviteCode, joinedAt: m.joinedAt });
+    return view;
+  }
+  const teamPersonView = (t, uid) => ({ ...userView(users.get(uid)), role: t.members.get(uid)?.role ?? null, joinedAt: t.members.get(uid)?.joinedAt ?? null, online: online(uid) });
+
+  function mustTeam(id) {
+    const t = teams.get(id);
+    if (!t) throw new HubError(404, 'Team not found');
+    return t;
+  }
+  function memberTeam(p, id) {
+    const t = mustTeam(id);
+    if (!t.members.has(actingUserId(p))) throw new HubError(403, 'You are not in this team');
+    return t;
+  }
+  function ownedTeam(p, id) {
+    const user = requireUser(p);
+    const t = memberTeam(p, id);
+    if (t.members.get(user.id).role !== 'owner') throw new HubError(403, 'Only the team’s owner can do this');
+    return t;
+  }
+  /** The team's lobby (#general, or its oldest public room) that new members land in. */
+  const lobbyOf = (t) =>
+    [...rooms.values()].filter((r) => r.teamId === t.id && r.kind === 'room' && r.visibility === 'public').sort((a, b) => (a.slug === 'general' ? -1 : b.slug === 'general' ? 1 : a.createdAt - b.createdAt))[0] ?? null;
+
+  function uniqueTeamSlug(name) {
+    const taken = new Set([...teams.values()].map((t) => t.slug));
+    const base = slugify(name) || 'team';
+    let slug = base;
+    for (let i = 2; taken.has(slug); i++) slug = `${base.slice(0, 28)}-${i}`;
+    return slug;
+  }
+  function putTeamMember(t, uid, role) {
+    const at = now();
+    t.members.set(uid, { role, joinedAt: t.members.get(uid)?.joinedAt ?? at });
+    store.addTeamMember(t.id, uid, role, t.members.get(uid).joinedAt);
+  }
+  function newTeam({ name, visibility, ownerId }) {
+    const t = { id: newId('team'), name, slug: uniqueTeamSlug(name), visibility: visibility === 'open' ? 'open' : 'invite', inviteCode: newInviteCode(), createdBy: ownerId, createdAt: now(), members: new Map() };
+    teams.set(t.id, t);
+    teamCodes.set(t.inviteCode, t.id);
+    store.saveTeam(t);
+    return t;
+  }
+  function newRoom(fields) {
+    const room = { id: newId(fields.kind === 'dm' ? 'dm' : 'room'), topic: '', visibility: 'public', dmKey: null, createdBy: null, createdAt: now(), lastMessageAt: null, members: [], ...fields };
+    rooms.set(room.id, room);
+    memberKeys.set(room.id, new Set());
+    store.saveRoom(room);
     return room;
   }
-  defaultRoom();
+  const teamDmKey = (teamId, key) => `${teamId}|${key}`;
 
+  // Data from before teams existed moves into one team, owned by the earliest person.
+  if (!teams.size && users.size) {
+    const all = [...users.values()].sort((a, b) => a.createdAt - b.createdAt);
+    const t = newTeam({ name: 'Crosstalk', visibility: 'invite', ownerId: all[0].id });
+    for (const u of all) putTeamMember(t, u.id, u.id === all[0].id ? 'owner' : 'member');
+    for (const r of rooms.values()) {
+      if (r.teamId) continue;
+      r.teamId = t.id;
+      if (r.dmKey) r.dmKey = teamDmKey(t.id, r.dmKey);
+      store.saveRoom(r);
+    }
+  }
+
+  function listTeams(p) {
+    if (p.kind !== 'user') return [];
+    return teamsOf(p.id).map((t) => teamView(t, p.id)).sort((a, b) => a.joinedAt - b.joinedAt);
+  }
+
+  /** Open teams anyone signed in can join, biggest first. */
+  function discoverTeams(p) {
+    const user = requireUser(p);
+    return [...teams.values()].filter((t) => t.visibility === 'open' && !t.members.has(user.id)).sort((a, b) => b.members.size - a.members.size).slice(0, 50).map((t) => teamView(t));
+  }
+
+  function createTeam(p, { name, visibility } = {}) {
+    const user = requireUser(p);
+    name = String(name ?? '').trim().slice(0, 48);
+    if (!name) throw new HubError(400, 'Team name is required');
+    if ([...teams.values()].filter((t) => t.createdBy === user.id).length >= MAX_TEAMS_CREATED) throw new HubError(429, `You can create at most ${MAX_TEAMS_CREATED} teams`);
+    const t = newTeam({ name, visibility, ownerId: user.id });
+    putTeamMember(t, user.id, 'owner');
+    const lobby = newRoom({ teamId: t.id, name: DEFAULT_ROOM.slug, slug: DEFAULT_ROOM.slug, topic: DEFAULT_ROOM.topic, kind: 'room', visibility: 'public', createdBy: user.id });
+    addMemberTo(lobby, 'user', user.id);
+    sendToUser(user.id, { type: 'team', team: teamView(t, user.id) });
+    broadcastRoomUpdate(lobby);
+    return { ...teamView(t, user.id), lobbyId: lobby.id };
+  }
+
+  function addToTeam(t, user) {
+    if (t.members.has(user.id)) return { ...teamView(t, user.id), lobbyId: lobbyOf(t)?.id ?? null };
+    putTeamMember(t, user.id, 'member');
+    const lobby = lobbyOf(t);
+    if (lobby) addMemberTo(lobby, 'user', user.id);
+    sendToUser(user.id, { type: 'team', team: teamView(t, user.id) });
+    for (const uid of t.members.keys()) {
+      if (uid === user.id) continue;
+      sendToUser(uid, { type: 'team', team: teamView(t, uid) });
+      sendToUser(uid, { type: 'team_member', teamId: t.id, person: teamPersonView(t, user.id) });
+    }
+    if (lobby) {
+      broadcastRoomUpdate(lobby);
+      systemMessage(lobby, `@${user.handle} joined the team`);
+    }
+    return { ...teamView(t, user.id), lobbyId: lobby?.id ?? null };
+  }
+
+  function joinTeam(p, id) {
+    const user = requireUser(p);
+    const t = mustTeam(id);
+    if (!t.members.has(user.id) && t.visibility !== 'open') throw new HubError(403, 'This team is invite-only. Ask someone in it for an invite link.');
+    return addToTeam(t, user);
+  }
+
+  const teamByCode = (code) => teams.get(teamCodes.get(String(code ?? '').trim()));
+  /** What an invite link points at, so the app can say "Join <team>?" before joining. */
+  function previewInvite(p, code) {
+    const user = requireUser(p);
+    const t = teamByCode(code);
+    if (!t) throw new HubError(404, 'That invite link is wrong or has been reset. Ask for a new one.');
+    return { ...teamView(t, user.id), member: t.members.has(user.id) };
+  }
+  function joinByCode(p, code) {
+    const user = requireUser(p);
+    const t = teamByCode(code);
+    if (!t) throw new HubError(404, 'That invite link is wrong or has been reset. Ask for a new one.');
+    return addToTeam(t, user);
+  }
+
+  /** Take someone out of a team: out of its rooms, and their agents out of its rooms and DMs. */
+  function dropFromTeam(t, uid) {
+    t.members.delete(uid);
+    store.removeTeamMember(t.id, uid);
+    const theirAgents = new Set([...agents.values()].filter((a) => a.ownerId === uid).map((a) => a.id));
+    for (const r of rooms.values()) {
+      if (r.teamId !== t.id) continue;
+      let changed = r.kind === 'room' && removeMemberFrom(r, 'user', uid);
+      for (const m of [...r.members]) if (m.kind === 'agent' && theirAgents.has(m.id)) changed = removeMemberFrom(r, 'agent', m.id) || changed;
+      if (changed) broadcastRoomUpdate(r);
+    }
+    sendToUser(uid, { type: 'team_removed', teamId: t.id });
+    for (const other of t.members.keys()) {
+      sendToUser(other, { type: 'team', team: teamView(t, other) });
+      sendToUser(other, { type: 'team_member_removed', teamId: t.id, userId: uid });
+    }
+  }
+
+  function leaveTeam(p, id) {
+    const user = requireUser(p);
+    const t = memberTeam(p, id);
+    if (t.members.size === 1) throw new HubError(400, 'You are the only member. Delete the team instead.');
+    if (t.members.get(user.id).role === 'owner' && ![...t.members].some(([uid, m]) => uid !== user.id && m.role === 'owner')) {
+      // Hand the team to whoever has been in it longest.
+      const [heir] = [...t.members].filter(([uid]) => uid !== user.id).sort((a, b) => a[1].joinedAt - b[1].joinedAt)[0];
+      putTeamMember(t, heir, 'owner');
+    }
+    dropFromTeam(t, user.id);
+    const lobby = lobbyOf(t);
+    if (lobby) systemMessage(lobby, `@${user.handle} left the team`);
+  }
+
+  function removeFromTeam(p, id, userId) {
+    const owner = requireUser(p);
+    if (userId === owner.id) return leaveTeam(p, id);
+    const t = ownedTeam(p, id);
+    if (!t.members.has(userId)) throw new HubError(404, 'They are not in this team');
+    dropFromTeam(t, userId);
+  }
+
+  function updateTeam(p, id, { name, visibility } = {}) {
+    const t = ownedTeam(p, id);
+    if (name !== undefined) t.name = String(name).trim().slice(0, 48) || t.name;
+    if (visibility !== undefined) t.visibility = visibility === 'open' ? 'open' : 'invite';
+    store.saveTeam(t);
+    for (const uid of t.members.keys()) sendToUser(uid, { type: 'team', team: teamView(t, uid) });
+    return teamView(t, p.id);
+  }
+
+  /** New invite link; the old one stops working. */
+  function resetTeamInvite(p, id) {
+    const t = ownedTeam(p, id);
+    teamCodes.delete(t.inviteCode);
+    t.inviteCode = newInviteCode();
+    teamCodes.set(t.inviteCode, t.id);
+    store.saveTeam(t);
+    for (const uid of t.members.keys()) sendToUser(uid, { type: 'team', team: teamView(t, uid) });
+    return teamView(t, p.id);
+  }
+
+  /** Deletes the team and everything in it: rooms, DMs and messages. */
+  function deleteTeam(p, id) {
+    const t = ownedTeam(p, id);
+    const members = [...t.members.keys()];
+    for (const r of [...rooms.values()]) {
+      if (r.teamId !== t.id) continue;
+      rooms.delete(r.id);
+      memberKeys.delete(r.id);
+    }
+    teams.delete(t.id);
+    teamCodes.delete(t.inviteCode);
+    store.deleteTeam(t.id);
+    for (const uid of members) sendToUser(uid, { type: 'team_removed', teamId: t.id });
+  }
+
+  // ---------- people ----------
   function createUser({ name, handleHint, email = null, imageUrl = null, clerkId = null, tokenHash = null }) {
     name = String(name ?? '').trim().slice(0, 48) || 'New user';
     const user = { id: newId('usr'), handle: uniqueHandle(handleHint || name), name, email, imageUrl, clerkId, tokenHash, createdAt: now(), profileSyncedAt: clerkId ? now() : null };
@@ -251,17 +481,15 @@ export function createHub({
     if (tokenHash) userTokens.set(tokenHash, user.id);
     if (clerkId) clerkUsers.set(clerkId, user.id);
     store.saveUser(user);
-    const room = defaultRoom();
-    addMemberTo(room, 'user', user.id);
-    broadcastRoomUpdate(room);
-    broadcastUsers({ type: 'person', person: userView(user) });
     return user;
   }
 
-  /** Everyone on this hub (name, handle, picture; never email), for adding to rooms and DMs. */
-  function listPeople(p) {
+  /** The people in a team (name, handle, picture, role; never email), for rooms and DMs. */
+  function listPeople(p, teamId) {
     if (p.kind !== 'user') throw new HubError(403, 'Only people can list people');
-    return [...users.values()].map((u) => ({ ...userView(u), online: (conns.get(pkey('user', u.id))?.size ?? 0) > 0 })).sort((a, b) => a.name.localeCompare(b.name));
+    if (!teamId) throw new HubError(400, 'Pick a team');
+    const t = memberTeam(p, teamId);
+    return [...t.members.keys()].filter((uid) => users.has(uid)).map((uid) => teamPersonView(t, uid)).sort((a, b) => a.name.localeCompare(b.name));
   }
 
   /** Dev sign-in (no identity provider). The server only exposes this when dev auth is on. */
@@ -301,21 +529,28 @@ export function createHub({
     }
     store.saveUser(u);
     for (const r of rooms.values()) if (isMember(r, 'user', u.id)) broadcastRoomUpdate(r);
-    broadcastUsers({ type: 'person', person: userView(u) });
+    broadcastTeammates(u.id, { type: 'person', person: userView(u) });
     return me(p);
   }
 
   // ---------- agents ----------
-  function listAgents(p) {
+  /** Your own agents, and the public agents of people you share a team with. */
+  function canSeeAgent(p, a) {
+    if (a.id === p.id) return true;
+    if (p.kind === 'user' && a.ownerId === p.id) return true;
+    return a.visibility === 'public' && sharesTeam(actingUserId(p), a.ownerId);
+  }
+  /** teamId narrows it to the agents usable in that team: yours, and public ones of its members. */
+  function listAgents(p, { teamId } = {}) {
+    const t = teamId ? memberTeam(p, teamId) : null;
     return [...agents.values()]
-      .filter((a) => a.visibility === 'public' || (p.kind === 'user' && a.ownerId === p.id) || a.id === p.id)
+      .filter((a) => canSeeAgent(p, a) && (!t || (p.kind === 'user' && a.ownerId === p.id) || a.id === p.id || t.members.has(a.ownerId)))
       .map((a) => agentView(a, p.kind === 'user' ? p.id : null));
   }
 
   function getAgent(p, id) {
     const a = agents.get(id) ?? agentByHandle(String(id).replace(/^@/, '').toLowerCase());
-    const visible = a && (a.visibility === 'public' || (p.kind === 'user' && a.ownerId === p.id) || a.id === p.id);
-    if (!visible) throw new HubError(404, 'Agent not found');
+    if (!a || !canSeeAgent(p, a)) throw new HubError(404, 'Agent not found');
     return agentView(a, p.kind === 'user' ? p.id : a.id === p.id ? a.ownerId : null);
   }
 
@@ -442,7 +677,7 @@ export function createHub({
     store.deleteAgent(a.id);
     pending.delete(a.id);
     statuses.delete(a.id);
-    broadcastUsers({ type: 'agent_removed', agentId: a.id });
+    broadcastTeammates(a.ownerId, { type: 'agent_removed', agentId: a.id });
   }
 
   function setStatus(p, { roomId, state, detail } = {}) {
@@ -468,18 +703,17 @@ export function createHub({
     return roomView(r);
   }
 
-  function createRoom(p, { name, topic, visibility } = {}) {
+  function createRoom(p, { teamId, name, topic, visibility } = {}) {
     const user = requireUser(p);
+    if (!teamId) throw new HubError(400, 'Pick a team for the room');
+    const t = memberTeam(p, teamId);
     name = String(name ?? '').trim().replace(/^#/, '').slice(0, 48);
     if (!name) throw new HubError(400, 'Room name is required');
-    const taken = new Set([...rooms.values()].filter((r) => r.kind === 'room').map((r) => r.slug));
+    const taken = new Set([...rooms.values()].filter((r) => r.kind === 'room' && r.teamId === t.id).map((r) => r.slug));
     const base = slugify(name) || 'room';
     let slug = base;
     for (let i = 2; taken.has(slug); i++) slug = `${base.slice(0, 28)}-${i}`;
-    const room = { id: newId('room'), name, slug, topic: String(topic ?? '').trim().slice(0, 200), kind: 'room', visibility: visibility === 'private' ? 'private' : 'public', dmKey: null, createdBy: user.id, createdAt: now(), lastMessageAt: null, members: [] };
-    rooms.set(room.id, room);
-    memberKeys.set(room.id, new Set());
-    store.saveRoom(room);
+    const room = newRoom({ teamId: t.id, name, slug, topic: String(topic ?? '').trim().slice(0, 200), kind: 'room', visibility: visibility === 'private' ? 'private' : 'public', createdBy: user.id });
     addMemberTo(room, 'user', user.id);
     broadcastRoomUpdate(room);
     return roomView(room);
@@ -499,7 +733,7 @@ export function createHub({
   function joinRoom(p, id) {
     const user = requireUser(p);
     const r = mustRoom(id);
-    if (r.kind !== 'room' || r.visibility !== 'public') throw new HubError(403, 'This room is invite-only');
+    if (r.kind !== 'room' || r.visibility !== 'public' || !canRead(p, r)) throw new HubError(403, 'This room is invite-only');
     if (addMemberTo(r, 'user', user.id)) broadcastRoomUpdate(r);
     return roomView(r);
   }
@@ -512,7 +746,9 @@ export function createHub({
     return roomView(r);
   }
 
-  const canInviteAgent = (p, agent) => agent.visibility === 'public' || (p.kind === 'user' && agent.ownerId === p.id);
+  /** Your own agents go anywhere you are; other public agents only into their owner's teams. */
+  const canInviteAgent = (p, agent, teamId) =>
+    (p.kind === 'user' && agent.ownerId === p.id) || (agent.visibility === 'public' && isTeamMember(teamId, agent.ownerId));
 
   function addMember(p, roomId, handle) {
     const r = mustRoom(roomId);
@@ -522,7 +758,10 @@ export function createHub({
     const agent = agentByHandle(h);
     const user = agent ? null : userByHandle(h);
     if (!agent && !user) throw new HubError(404, `No one called @${h}`);
-    if (agent && !canInviteAgent(p, agent)) throw new HubError(403, `@${h} is private; only its owner can add it`);
+    if (user && !isTeamMember(r.teamId, user.id)) throw new HubError(403, `@${h} is not in this team yet. Invite them to the team first.`);
+    if (agent && !canInviteAgent(p, agent, r.teamId)) {
+      throw new HubError(403, agent.visibility === 'private' ? `@${h} is private; only its owner can add it` : `@${h} belongs to someone outside this team`);
+    }
     const target = agent ?? user;
     if (addMemberTo(r, agent ? 'agent' : 'user', target.id)) {
       systemMessage(r, `@${memberView({ kind: p.kind, id: p.id }).handle} added @${target.handle}`);
@@ -546,21 +785,25 @@ export function createHub({
     return roomView(r);
   }
 
-  function openDM(p, handle) {
+  /** A DM lives in a team. Without a teamId, use the first of your teams the other side is in. */
+  function openDM(p, handle, teamId) {
     const user = requireUser(p);
     const h = String(handle ?? '').trim().replace(/^@/, '').toLowerCase();
     const agent = agentByHandle(h);
     const person = agent ? null : userByHandle(h);
-    if (person) return openPersonDM(user, person);
-    if (!agent) throw new HubError(404, `No one called @${h}`);
-    if (!canInviteAgent(p, agent)) throw new HubError(403, `@${h} is private`);
-    const dmKey = `${user.id}:${agent.id}`;
+    if (!agent && !person) throw new HubError(404, `No one called @${h}`);
+    const reachable = (tid) => (person ? isTeamMember(tid, person.id) : canInviteAgent(p, agent, tid));
+    if (teamId) memberTeam(p, teamId);
+    else teamId = listTeams(p).find((t) => reachable(t.id))?.id;
+    if (!teamId || !reachable(teamId)) {
+      if (person) throw new HubError(403, `@${h} is not in this team`);
+      throw new HubError(403, agent.visibility === 'private' ? `@${h} is private` : `@${h} belongs to someone outside this team`);
+    }
+    if (person) return openPersonDM(user, person, teamId);
+    const dmKey = teamDmKey(teamId, `${user.id}:${agent.id}`);
     let r = [...rooms.values()].find((x) => x.kind === 'dm' && x.dmKey === dmKey);
     if (!r) {
-      r = { id: newId('dm'), name: agent.name, slug: `dm-${user.id}-${agent.id}`, topic: '', kind: 'dm', visibility: 'private', dmKey, createdBy: user.id, createdAt: now(), lastMessageAt: null, members: [] };
-      rooms.set(r.id, r);
-      memberKeys.set(r.id, new Set());
-      store.saveRoom(r);
+      r = newRoom({ teamId, name: agent.name, slug: `dm-${user.id}-${agent.id}`, kind: 'dm', visibility: 'private', dmKey, createdBy: user.id });
       addMemberTo(r, 'user', user.id);
       addMemberTo(r, 'agent', agent.id);
       broadcastRoomUpdate(r);
@@ -569,15 +812,13 @@ export function createHub({
   }
 
   /** A private conversation between two people. Agents can't be added to it. */
-  function openPersonDM(user, other) {
+  function openPersonDM(user, other, teamId) {
     if (other.id === user.id) throw new HubError(400, 'You can’t message yourself');
-    const dmKey = `people:${[user.id, other.id].sort().join(':')}`;
+    const pair = [user.id, other.id].sort().join(':');
+    const dmKey = teamDmKey(teamId, `people:${pair}`);
     let r = [...rooms.values()].find((x) => x.kind === 'dm' && x.dmKey === dmKey);
     if (!r) {
-      r = { id: newId('dm'), name: `${user.name} & ${other.name}`.slice(0, 48), slug: `dm-${dmKey.slice(7)}`, topic: '', kind: 'dm', visibility: 'private', dmKey, createdBy: user.id, createdAt: now(), lastMessageAt: null, members: [] };
-      rooms.set(r.id, r);
-      memberKeys.set(r.id, new Set());
-      store.saveRoom(r);
+      r = newRoom({ teamId, name: `${user.name} & ${other.name}`.slice(0, 48), slug: `dm-${pair}`, kind: 'dm', visibility: 'private', dmKey, createdBy: user.id });
       addMemberTo(r, 'user', user.id);
       addMemberTo(r, 'user', other.id);
       broadcastRoomUpdate(r);
@@ -632,7 +873,7 @@ export function createHub({
     if (!text) throw new HubError(400, 'Message is empty');
     if (text.length > MAX_TEXT) throw new HubError(413, `Message is longer than ${MAX_TEXT} characters`);
     if (!isMember(room, p.kind, p.id)) {
-      if (p.kind === 'user' && room.kind === 'room' && room.visibility === 'public') {
+      if (p.kind === 'user' && room.kind === 'room' && canRead(p, room)) {
         addMemberTo(room, 'user', p.id);
         broadcastRoomUpdate(room);
       } else {
@@ -652,7 +893,7 @@ export function createHub({
     // Mentioning an agent that isn't here yet invites it, if the sender is allowed to.
     let invited = false;
     if (room.kind === 'room') {
-      for (const a of mentionedAgents) if (canInviteAgent(p, a) && addMemberTo(room, 'agent', a.id)) invited = true;
+      for (const a of mentionedAgents) if (canInviteAgent(p, a, room.teamId) && addMemberTo(room, 'agent', a.id)) invited = true;
     }
 
     const msg = addMessage(room, { sender: { kind: p.kind, id: p.id }, text, mentions: resolved, replyTo: parent ? parent.id : null, depth });
@@ -781,7 +1022,10 @@ export function createHub({
     const handle = p.kind === 'agent' ? p.agent.handle : p.user.handle;
     const afterSeq = after ? (store.messageById(after)?.seq ?? 0) : 0;
     const n = Math.min(Math.max(Number(limit) || 20, 1), 100);
-    return store.mentionsFor(p.kind, p.id, handle, { afterSeq, limit: n }).map((m) => ({ ...messageView(m), room: { id: m.roomId, name: m.roomName } }));
+    return store
+      .mentionsFor(p.kind, p.id, handle, { afterSeq, limit: n })
+      .filter((m) => rooms.has(m.roomId) && canRead(p, rooms.get(m.roomId)))
+      .map((m) => ({ ...messageView(m), room: { id: m.roomId, name: m.roomName, teamId: rooms.get(m.roomId).teamId ?? null } }));
   }
 
   // ---------- connections ----------
@@ -791,7 +1035,7 @@ export function createHub({
     const wasOffline = set.size === 0;
     set.add(conn);
     conns.set(key, set);
-    if (p.kind === 'user' && wasOffline) broadcastUsers({ type: 'presence', userId: p.id, online: true }, (uid) => uid !== p.id);
+    if (p.kind === 'user' && wasOffline) broadcastUsers({ type: 'presence', userId: p.id, online: true }, (uid) => uid !== p.id && sharesTeam(uid, p.id));
     if (p.kind === 'agent') {
       const a = p.agent;
       a.lastConnectedAt = now();
@@ -802,7 +1046,7 @@ export function createHub({
       store.saveAgent(a);
       if (wasOffline) {
         for (const k of notices.keys()) if (k.startsWith(`offline:${p.id}:`)) notices.delete(k);
-        broadcastUsers({ type: 'presence', agentId: p.id, online: true });
+        broadcastTeammates(p.agent.ownerId, { type: 'presence', agentId: p.id, online: true });
       }
       sendToUser(a.ownerId, { type: 'agent', agent: agentView(a, a.ownerId) });
       const q = pending.get(p.id);
@@ -815,7 +1059,7 @@ export function createHub({
       set.delete(conn);
       if (set.size) return;
       if (conns.get(key) === set) conns.delete(key);
-      if (p.kind === 'user' && !conns.get(key)?.size) broadcastUsers({ type: 'presence', userId: p.id, online: false });
+      if (p.kind === 'user' && !conns.get(key)?.size) broadcastTeammates(p.id, { type: 'presence', userId: p.id, online: false });
       if (p.kind === 'agent' && !isOnline(p.id) && agents.has(p.id)) {
         const a = p.agent;
         a.lastSeenAt = now();
@@ -823,7 +1067,7 @@ export function createHub({
         const st = statuses.get(p.id);
         statuses.delete(p.id);
         if (st && rooms.get(st.roomId)) broadcastRoom(rooms.get(st.roomId), { type: 'status', agentId: p.id, handle: a.handle, roomId: st.roomId, state: 'idle' });
-        broadcastUsers({ type: 'presence', agentId: p.id, online: false, lastSeenAt: a.lastSeenAt });
+        broadcastTeammates(a.ownerId, { type: 'presence', agentId: p.id, online: false, lastSeenAt: a.lastSeenAt });
         sendToUser(a.ownerId, { type: 'agent', agent: agentView(a, a.ownerId) });
       }
     };
@@ -844,6 +1088,17 @@ export function createHub({
     signup,
     listAgents,
     listPeople,
+    listTeams,
+    discoverTeams,
+    createTeam,
+    joinTeam,
+    previewInvite,
+    joinByCode,
+    leaveTeam,
+    removeFromTeam,
+    updateTeam,
+    resetTeamInvite,
+    deleteTeam,
     getAgent,
     createAgent,
     updateAgent,
@@ -869,6 +1124,6 @@ export function createHub({
     mentions,
     subscribe,
     closeAll,
-    stats: () => ({ users: users.size, agents: agents.size, rooms: rooms.size, connections: [...conns.values()].reduce((n, s) => n + s.size, 0) }),
+    stats: () => ({ users: users.size, teams: teams.size, agents: agents.size, rooms: rooms.size, connections: [...conns.values()].reduce((n, s) => n + s.size, 0) }),
   };
 }

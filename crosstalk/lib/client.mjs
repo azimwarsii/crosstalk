@@ -66,8 +66,21 @@ export class CrosstalkClient {
   me() {
     return this.request('GET', '/api/me');
   }
-  agents() {
-    return this.request('GET', '/api/agents');
+  teams() {
+    return this.request('GET', '/api/teams');
+  }
+  createTeam(fields) {
+    return this.request('POST', '/api/teams', fields);
+  }
+  /** Join a team with the code from its invite link (…/join/<code>). */
+  joinTeam(code) {
+    return this.request('POST', `/api/invites/${encodeURIComponent(code)}`);
+  }
+  people(teamId) {
+    return this.request('GET', `/api/teams/${encodeURIComponent(teamId)}/people`);
+  }
+  agents({ teamId } = {}) {
+    return this.request('GET', `/api/agents${teamId ? `?team=${encodeURIComponent(teamId)}` : ''}`);
   }
   createAgent(fields) {
     return this.request('POST', '/api/agents', fields);
@@ -81,8 +94,8 @@ export class CrosstalkClient {
   addMember(roomId, handle) {
     return this.request('POST', `/api/rooms/${encodeURIComponent(roomId)}/members`, { handle });
   }
-  openDM(handle) {
-    return this.request('POST', '/api/dm', { handle });
+  openDM(handle, teamId) {
+    return this.request('POST', '/api/dm', { handle, teamId });
   }
   messages(roomId, { limit, after, before } = {}) {
     const q = new URLSearchParams();

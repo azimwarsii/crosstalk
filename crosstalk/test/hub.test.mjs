@@ -3,14 +3,17 @@ import assert from 'node:assert/strict';
 import { createStore } from '../server/store.mjs';
 import { createHub, parseMentions } from '../server/hub.mjs';
 
+/** Alice makes a team and Bob joins it with the invite code. */
 function setup(opts = {}) {
   const hub = createHub({ store: createStore(':memory:'), ...opts });
   const alice = hub.signup('Alice');
   const bob = hub.signup('Bob');
   const pa = hub.authenticate(alice.token);
   const pb = hub.authenticate(bob.token);
-  const lobby = hub.listRooms(pa).find((r) => r.slug === 'general');
-  return { hub, pa, pb, lobby };
+  const team = hub.createTeam(pa, { name: 'Acme' });
+  hub.joinByCode(pb, team.inviteCode);
+  const lobby = hub.listRooms(pa).find((r) => r.id === team.lobbyId);
+  return { hub, pa, pb, lobby, team };
 }
 
 function connect(hub, token, onTrigger = () => {}) {
@@ -47,14 +50,14 @@ test('mention wakes an agent; only its owner gets owner standing', () => {
   assert.equal(t[0].accessTier, 'owner');
   assert.equal(t[1].accessTier, 'guest');
   assert.equal(t[1].sender.handle, 'bob');
-  assert.equal(t[1].context.length, 1, 'trigger carries earlier room messages');
+  assert.deepEqual(t[1].context.map((m) => m.text), ['@bob joined the team', '@coder fix the build'], 'trigger carries earlier room messages');
 });
 
 test('mentioning a public agent invites it; private agents need their owner', () => {
-  const { hub, pa, pb } = setup();
+  const { hub, pa, pb, team } = setup();
   hub.createAgent(pa, { handle: 'helper', visibility: 'public' });
   hub.createAgent(pa, { handle: 'secret', visibility: 'private' });
-  const room = hub.createRoom(pb, { name: 'bobs-room' });
+  const room = hub.createRoom(pb, { name: 'bobs-room', teamId: team.id });
 
   const r = hub.postMessage(pb, room.id, { text: '@helper @secret hello' });
   const members = hub.getRoom(pb, room.id).members.map((m) => m.handle);
@@ -189,8 +192,9 @@ test('pairing codes: owner-only, work once, expire, and must match the agent', (
 });
 
 test('people can DM each other privately; agents stay out of those DMs', () => {
-  const { hub, pa, pb } = setup();
+  const { hub, pa, pb, team } = setup();
   const pc = hub.authenticate(hub.signup('Carol').token);
+  hub.joinByCode(pc, team.inviteCode);
   const { token } = hub.createAgent(pa, { handle: 'coder' });
   const agent = connect(hub, token);
   const dm = hub.openDM(pa, '@bob');
@@ -207,13 +211,13 @@ test('people can DM each other privately; agents stay out of those DMs', () => {
   assert.match(r.notice, /can’t join a direct message between people/);
   assert.equal(agent.triggers().length, 0);
   assert.throws(() => hub.openDM(pa, 'alice'), /yourself/);
-  assert.ok(!JSON.stringify(hub.listPeople(pa)).includes('@'), 'no emails in the people list');
-  assert.deepEqual(hub.listPeople(pa).map((u) => u.handle), ['alice', 'bob', 'carol']);
+  assert.ok(!JSON.stringify(hub.listPeople(pa, team.id)).includes('@'), 'no emails in the people list');
+  assert.deepEqual(hub.listPeople(pa, team.id).map((u) => u.handle), ['alice', 'bob', 'carol']);
 });
 
 test('someone added to a room can bring their own private agent into it', () => {
-  const { hub, pa, pb } = setup();
-  const room = hub.createRoom(pa, { name: 'project', visibility: 'private' });
+  const { hub, pa, pb, team } = setup();
+  const room = hub.createRoom(pa, { name: 'project', visibility: 'private', teamId: team.id });
   hub.createAgent(pb, { handle: 'bobs-bot', visibility: 'private' });
   assert.throws(() => hub.addMember(pb, room.id, 'bobs-bot'), /Join the room first/);
   hub.addMember(pa, room.id, 'bob');
@@ -223,7 +227,7 @@ test('someone added to a room can bring their own private agent into it', () => 
 });
 
 test('search finds messages in a room the person can read', () => {
-  const { hub, pa, pb, lobby } = setup();
+  const { hub, pa, pb, lobby, team } = setup();
   hub.postMessage(pa, lobby.id, { text: 'The CTA button needs more contrast' });
   hub.postMessage(pb, lobby.id, { text: 'agreed, contrast is low' });
   const gone = hub.postMessage(pb, lobby.id, { text: 'contrast typo' });
@@ -231,16 +235,162 @@ test('search finds messages in a room the person can read', () => {
   const found = hub.searchMessages(pa, lobby.id, 'CONTRAST');
   assert.deepEqual(found.map((m) => m.text), ['agreed, contrast is low', 'The CTA button needs more contrast']);
   assert.throws(() => hub.searchMessages(pa, lobby.id, 'a'), /at least 2/);
-  const priv = hub.createRoom(pa, { name: 'secret', visibility: 'private' });
+  const priv = hub.createRoom(pa, { name: 'secret', visibility: 'private', teamId: team.id });
   assert.throws(() => hub.searchMessages(pb, priv.id, 'anything'), /cannot see/);
 });
 
 test('agents cannot read rooms they are not in; strangers cannot read private rooms', () => {
-  const { hub, pa, pb } = setup();
+  const { hub, pa, pb, team } = setup();
   const { token } = hub.createAgent(pa, { handle: 'coder' });
   const pagent = hub.authenticate(token);
-  const priv = hub.createRoom(pa, { name: 'secret-plans', visibility: 'private' });
+  const priv = hub.createRoom(pa, { name: 'secret-plans', visibility: 'private', teamId: team.id });
   assert.throws(() => hub.getMessages(pb, priv.id), /cannot see/);
   assert.throws(() => hub.getMessages(pagent, priv.id), /cannot see/);
   assert.throws(() => hub.postMessage(pb, priv.id, { text: 'hi' }), /Not a member/);
+});
+
+// ---------- teams ----------
+
+test('creating a team makes you its owner and gives it a #general room', () => {
+  const hub = createHub({ store: createStore(':memory:') });
+  const pa = hub.authenticate(hub.signup('Alice').token);
+  assert.deepEqual(hub.listTeams(pa), [], 'a new person starts with no team');
+  assert.deepEqual(hub.listRooms(pa), []);
+  const team = hub.createTeam(pa, { name: 'Design Studio' });
+  assert.equal(team.role, 'owner');
+  assert.equal(team.slug, 'design-studio');
+  assert.equal(team.visibility, 'invite');
+  assert.ok(team.inviteCode.length >= 10);
+  const rooms = hub.listRooms(pa);
+  assert.deepEqual(rooms.map((r) => [r.slug, r.teamId]), [['general', team.id]]);
+  assert.equal(hub.createTeam(pa, { name: 'Design Studio' }).slug, 'design-studio-2');
+  assert.throws(() => hub.createTeam(pa, { name: '  ' }), /name is required/);
+});
+
+test('people only see the people, rooms and agents of their own teams', () => {
+  const { hub, pa, pb, lobby, team } = setup();
+  const pc = hub.authenticate(hub.signup('Carol').token);
+  const other = hub.createTeam(pc, { name: 'Other Co' });
+  hub.createAgent(pc, { handle: 'carols-bot' });
+  hub.createAgent(pa, { handle: 'alices-bot' });
+
+  assert.deepEqual(hub.listPeople(pa, team.id).map((u) => u.handle), ['alice', 'bob']);
+  assert.throws(() => hub.listPeople(pa, other.id), /not in this team/);
+  assert.ok(!hub.listRooms(pc).some((r) => r.teamId === team.id), 'Carol sees none of Acme’s rooms');
+  assert.throws(() => hub.getMessages(pc, lobby.id), /cannot see/);
+  assert.throws(() => hub.postMessage(pc, lobby.id, { text: 'hi' }), /Not a member/);
+  assert.throws(() => hub.joinRoom(pc, lobby.id), /invite-only/);
+  assert.deepEqual(hub.listAgents(pb).map((a) => a.handle), ['alices-bot'], 'teammates’ public agents only');
+  assert.throws(() => hub.getAgent(pb, 'carols-bot'), /not found/);
+
+  // You can't pull outsiders (or their agents) into a team's rooms or DMs.
+  assert.throws(() => hub.addMember(pa, lobby.id, 'carol'), /not in this team yet/);
+  assert.throws(() => hub.openDM(pa, 'carol'), /not in this team/);
+  const r = hub.postMessage(pa, lobby.id, { text: '@carols-bot hello?' });
+  assert.deepEqual(r.queued, []);
+  assert.ok(!hub.getRoom(pa, lobby.id).members.some((m) => m.handle === 'carols-bot'));
+  assert.throws(() => hub.createRoom(pa, { name: 'x', teamId: other.id }), /not in this team/);
+});
+
+test('invite links and open teams', () => {
+  const { hub, pa, team } = setup();
+  const pc = hub.authenticate(hub.signup('Carol').token);
+  assert.deepEqual(hub.discoverTeams(pc), [], 'invite-only teams are not listed');
+  assert.throws(() => hub.joinTeam(pc, team.id), /invite-only/);
+  assert.equal(hub.previewInvite(pc, team.inviteCode).name, 'Acme');
+
+  const reset = hub.resetTeamInvite(pa, team.id);
+  assert.notEqual(reset.inviteCode, team.inviteCode);
+  assert.throws(() => hub.joinByCode(pc, team.inviteCode), /wrong or has been reset/);
+
+  hub.updateTeam(pa, team.id, { visibility: 'open' });
+  assert.deepEqual(hub.discoverTeams(pc).map((t) => t.name), ['Acme']);
+  assert.equal(hub.discoverTeams(pc)[0].inviteCode, undefined, 'outsiders never see the invite code');
+  const joined = hub.joinTeam(pc, team.id);
+  assert.equal(joined.role, 'member');
+  assert.ok(hub.getRoom(pc, joined.lobbyId).members.some((m) => m.handle === 'carol'), 'new members land in #general');
+  assert.match(hub.getMessages(pc, joined.lobbyId).at(-1).text, /@carol joined the team/);
+  assert.throws(() => hub.updateTeam(pc, team.id, { name: 'Mine now' }), /owner/);
+  assert.throws(() => hub.resetTeamInvite(pc, team.id), /owner/);
+});
+
+test('leaving a team takes you and your agents out of its rooms', () => {
+  const { hub, pa, pb, lobby, team } = setup();
+  hub.createAgent(pb, { handle: 'bobs-bot' });
+  hub.postMessage(pb, lobby.id, { text: '@bobs-bot join us' });
+  const dm = hub.openDM(pa, 'bob');
+  assert.ok(hub.getRoom(pa, lobby.id).members.some((m) => m.handle === 'bobs-bot'));
+
+  hub.leaveTeam(pb, team.id);
+  assert.deepEqual(hub.listTeams(pb), []);
+  assert.deepEqual(hub.listRooms(pb), []);
+  assert.throws(() => hub.getMessages(pb, dm.id), /cannot see/, 'DMs in the team go with it');
+  const members = hub.getRoom(pa, lobby.id).members.map((m) => m.handle);
+  assert.ok(!members.includes('bob') && !members.includes('bobs-bot'));
+  assert.deepEqual(hub.listAgents(pa).map((a) => a.handle), []);
+
+  // The last owner leaving hands the team to the longest-standing member.
+  hub.joinByCode(pb, team.inviteCode);
+  hub.leaveTeam(pa, team.id);
+  assert.equal(hub.listTeams(pb)[0].role, 'owner');
+  assert.throws(() => hub.leaveTeam(pb, team.id), /only member/);
+  hub.deleteTeam(pb, team.id);
+  assert.deepEqual(hub.listTeams(pb), []);
+  assert.throws(() => hub.getRoom(pb, lobby.id), /not found/);
+});
+
+test('the owner can remove people from the team', () => {
+  const { hub, pa, pb, team } = setup();
+  assert.throws(() => hub.removeFromTeam(pb, team.id, pa.id), /owner/);
+  hub.removeFromTeam(pa, team.id, pb.id);
+  assert.deepEqual(hub.listPeople(pa, team.id).map((u) => u.handle), ['alice']);
+});
+
+test('the same two people get a separate DM in each team they share', () => {
+  const { hub, pa, pb, team } = setup();
+  const second = hub.createTeam(pa, { name: 'Side project' });
+  hub.joinByCode(pb, second.inviteCode);
+  const dm1 = hub.openDM(pa, 'bob', team.id);
+  const dm2 = hub.openDM(pa, 'bob', second.id);
+  assert.notEqual(dm1.id, dm2.id);
+  assert.equal(dm2.teamId, second.id);
+  assert.equal(hub.openDM(pb, 'alice', second.id).id, dm2.id);
+});
+
+test('data from before teams moves into one team owned by the first person', async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const path = await import('node:path');
+  const { DatabaseSync } = await import('node:sqlite');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crosstalk-migrate-'));
+  const file = path.join(dir, 'old.db');
+  try {
+    // A version-1 database: two people, a room, and a DM.
+    const db = new DatabaseSync(file);
+    const { MIGRATIONS } = await import('../server/store.mjs');
+    db.exec(MIGRATIONS[0]);
+    db.exec('PRAGMA user_version = 1');
+    db.exec(`INSERT INTO users (id, handle, name, created_at) VALUES ('usr_a', 'alice', 'Alice', 1), ('usr_b', 'bob', 'Bob', 2);
+      INSERT INTO rooms (id, name, slug, kind, visibility, created_at) VALUES ('room_g', 'general', 'general', 'room', 'public', 1);
+      INSERT INTO rooms (id, name, slug, kind, visibility, dm_key, created_at) VALUES ('dm_ab', 'Alice & Bob', 'dm-ab', 'dm', 'private', 'people:usr_a:usr_b', 3);
+      INSERT INTO members (room_id, kind, member_id, joined_at) VALUES ('room_g', 'user', 'usr_a', 1), ('room_g', 'user', 'usr_b', 2), ('dm_ab', 'user', 'usr_a', 3), ('dm_ab', 'user', 'usr_b', 3);`);
+    db.close();
+
+    const store = createStore(file);
+    const hub = createHub({ store });
+    const alice = { kind: 'user', id: 'usr_a', user: { id: 'usr_a', handle: 'alice' } };
+    const bob = { kind: 'user', id: 'usr_b', user: { id: 'usr_b', handle: 'bob' } };
+    const [team] = hub.listTeams(alice);
+    assert.equal(team.name, 'Crosstalk');
+    assert.equal(team.role, 'owner');
+    assert.equal(hub.listTeams(bob)[0].role, 'member');
+    assert.ok(hub.listRooms(bob).every((r) => r.teamId === team.id));
+    assert.equal(hub.openDM(alice, 'bob').id, 'dm_ab', 'the old DM is found, not duplicated');
+    store.close();
+
+    const again = createHub({ store: createStore(file) });
+    assert.equal(again.listTeams(alice).length, 1, 'migration runs once');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

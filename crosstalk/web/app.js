@@ -4,12 +4,18 @@
   const $$ = (s, el = document) => [...el.querySelectorAll(s)];
   const esc = window.escapeHtml;
   const md = window.renderMarkdown;
-  const KEYS = { token: 'crosstalk.devToken', room: 'crosstalk.room', ui: 'crosstalk.ui2', theme: 'crosstalk.theme', seenMention: 'crosstalk.seenMention' };
+  const KEYS = { token: 'crosstalk.devToken', room: 'crosstalk.room', team: 'crosstalk.team', invite: 'crosstalk.invite', ui: 'crosstalk.ui2', theme: 'crosstalk.theme', seenMention: 'crosstalk.seenMention' };
   const local = {
     get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
     set: (k, v) => { try { localStorage.setItem(k, v); } catch { /* private mode */ } },
     del: (k) => { try { localStorage.removeItem(k); } catch { /* private mode */ } },
   };
+  // An invite link (/join/<code>) survives the trip through sign-in.
+  const JOIN_RE = /^\/join\/([A-Za-z0-9_-]{6,64})\/?$/;
+  {
+    const m = location.pathname.match(JOIN_RE);
+    if (m) local.set(KEYS.invite, m[1]);
+  }
   const PAGE = 60;
   const isMac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
   const MOD = isMac ? '⌘' : 'Ctrl+';
@@ -93,7 +99,11 @@
     settings: null,
     roomDialog: null,
     nav: { stack: [], index: -1, moving: false },
-    people: new Map(),
+    people: new Map(), // people in the current team
+    teams: new Map(),
+    teamId: null, // the team the sidebar shows
+    appReady: false,
+    eventsStarted: false,
   };
   const UI = (() => {
     try {
@@ -237,6 +247,23 @@
     return room.name;
   }
 
+  // ---------- teams ----------
+  const currentTeam = () => S.teams.get(S.teamId) || null;
+  const teamRooms = (teamId = S.teamId) => [...S.rooms.values()].filter((r) => r.teamId === teamId);
+  /** Agents you can use in the current team: yours, and shared ones of its members. */
+  const inTeamAgent = (a) => mine(a) || S.people.has(a.owner?.id);
+  const teamUnread = (teamId) => teamRooms(teamId).reduce((n, r) => n + (S.unread.get(r.id) || 0), 0);
+  const inviteUrl = (t) => `${location.origin}/join/${encodeURIComponent(t.inviteCode)}`;
+  function teamTile(t, size = '') {
+    if (!t) return '';
+    return `<span class="team-tile ${size}" style="background:hsl(${hue(t.slug || t.name)} 58% 50%)" aria-hidden="true">${esc((String(t.name).trim()[0] || '?').toUpperCase())}</span>`;
+  }
+  /** "https://hub/join/abc", "/join/abc" or just "abc". */
+  const codeFrom = (text) => {
+    const v = String(text || '').trim();
+    return (v.match(/\/join\/([A-Za-z0-9_-]+)/) || [])[1] || v;
+  };
+
   let toastTimer;
   function toast(text) {
     const el = $('#toast');
@@ -258,7 +285,9 @@
       if (it === '-') return '<div class="msep"></div>';
       if (it.html) return it.html;
       if (it.label && !it.action) return `<div class="mlabel">${esc(it.label)}</div>`;
-      return `<button class="mi ${it.danger ? 'danger' : ''} ${it.checked ? 'checked' : ''}" type="button" role="menuitem" data-mi="${i}">${it.icon ? icon(it.icon) : ''}<span>${esc(it.text)}</span></button>`;
+      const lead = it.lead || (it.icon ? icon(it.icon) : '');
+      const text = it.sub ? `<span class="mtext"><span>${esc(it.text)}</span><small>${esc(it.sub)}</small></span>` : `<span>${esc(it.text)}</span>`;
+      return `<button class="mi ${it.danger ? 'danger' : ''} ${it.checked ? 'checked' : ''}" type="button" role="menuitem" data-mi="${i}">${lead}${text}${it.badge ? `<span class="badge">${esc(it.badge)}</span>` : ''}</button>`;
     }).join('');
     el.hidden = false;
     el.onclick = (e) => {
@@ -298,7 +327,7 @@
 
   // ---------- boot ----------
   function showOnly(id) {
-    for (const x of ['boot', 'signin', 'app']) $(`#${x}`).hidden = x !== id;
+    for (const x of ['boot', 'signin', 'onboard', 'app']) $(`#${x}`).hidden = x !== id;
   }
   function bootError(text) {
     showOnly('boot');
@@ -395,8 +424,21 @@
       else window.Clerk.unmountSignIn($('#clerk-signin'));
       signInMounted = null;
     }
-    if (onAuthPage() || location.hash.startsWith('#/') || /__clerk/.test(location.search)) history.replaceState(null, '', '/');
+    if (onAuthPage() || JOIN_RE.test(location.pathname) || location.hash.startsWith('#/') || /__clerk/.test(location.search)) history.replaceState(null, '', '/');
+    S.teams = new Map((S.me.teams || []).map((t) => [t.id, t]));
     renderMe();
+    S.starting = false;
+    const code = local.get(KEYS.invite);
+    if (code) return showInvite(code);
+    if (!S.teams.size) return showOnboard();
+    return enterApp();
+  }
+
+  /** Show the app for a team (the last one used, unless told otherwise). */
+  async function enterApp(teamId = null, roomId = null) {
+    const saved = local.get(KEYS.team);
+    S.teamId = [teamId, saved].find((id) => id && S.teams.has(id)) || S.teams.keys().next().value;
+    local.set(KEYS.team, S.teamId);
     applyUi();
     try {
       await Promise.all([loadRooms(), loadAgents(), loadPeople()]);
@@ -404,20 +446,282 @@
       return bootError(e.message);
     }
     showOnly('app');
-    const saved = local.get(KEYS.room);
-    const general = [...S.rooms.values()].find((r) => r.slug === 'general');
-    const first = S.rooms.get(saved) || general || S.rooms.values().next().value;
+    S.appReady = true;
+    renderTeamSwitch();
     renderSidebar();
-    if (first) await openRoom(first.id);
-    connectEvents();
+    await openTeamRoom(roomId);
+    if (!S.eventsStarted) {
+      S.eventsStarted = true;
+      connectEvents();
+    }
     refreshMentions(true);
-    S.starting = false;
+  }
+
+  /** Open a room in the current team: the one asked for, the last one used, or #general. */
+  async function openTeamRoom(roomId = null) {
+    const ok = (id) => id && S.rooms.get(id)?.teamId === S.teamId;
+    const target = [roomId, local.get(`${KEYS.room}.${S.teamId}`)].find(ok) || lobbyRoom()?.id;
+    if (target) return openRoom(target);
+    S.active = null;
+    renderAll();
+  }
+  const lobbyRoom = () => {
+    const rooms = teamRooms().filter((r) => r.kind === 'room');
+    return rooms.find((r) => r.slug === 'general') || rooms.find(isJoined) || rooms[0] || teamRooms()[0] || null;
+  };
+
+  /** Make another team current: its people, then its last room. */
+  async function setTeam(teamId) {
+    if (!S.teams.has(teamId) || teamId === S.teamId) return;
+    S.teamId = teamId;
+    local.set(KEYS.team, teamId);
+    S.people = new Map();
+    S.filter = '';
+    $('#side-filter').value = '';
+    if (['people', 'directory', 'profile'].includes(S.panel.mode)) S.panel = { mode: 'room', id: null };
+    renderTeamSwitch();
+    try { await loadPeople(); } catch (e) { toast(e.message); }
+    renderSidebar();
+  }
+  async function switchTeam(teamId, roomId = null) {
+    closeMenu();
+    await setTeam(teamId);
+    await openTeamRoom(roomId);
+  }
+  /** After creating or joining a team: pick up its rooms and agents, then go there. */
+  async function goToTeam(team, roomId = null) {
+    S.teams.set(team.id, team);
+    local.del(KEYS.invite);
+    if (!S.appReady) return enterApp(team.id, roomId);
+    await Promise.all([loadRooms(), loadAgents()]);
+    if (team.id === S.teamId) { await loadPeople(); renderAll(); return openTeamRoom(roomId); }
+    return switchTeam(team.id, roomId);
+  }
+
+  function renderTeamSwitch() {
+    const t = currentTeam();
+    $('#ws-tile').innerHTML = teamTile(t, 'sm');
+    $('#ws-name').textContent = t?.name || 'Crosstalk';
+    const others = [...S.teams.keys()].filter((id) => id !== S.teamId).reduce((n, id) => n + teamUnread(id), 0);
+    $('#ws-switch').classList.toggle('has-unread', others > 0);
+    $('#ws-switch').title = others ? `Switch team (${others} unread in other teams)` : 'Switch team';
+  }
+
+  // ---------- onboarding: no team yet, or an invite link ----------
+  function moveTeamForms(where, tab = 'create') {
+    $(where).appendChild($('#team-forms'));
+    setTeamTab(tab);
+    for (const f of [$('#form-team-create'), $('#form-team-join')]) {
+      f.reset();
+      f.querySelector('[data-error]').textContent = '';
+    }
+    loadOpenTeams();
+  }
+  function setTeamTab(tab) {
+    for (const b of $$('[data-team-tab]')) b.classList.toggle('on', b.dataset.teamTab === tab);
+    for (const p of $$('#team-forms .tf-pane')) p.hidden = p.dataset.pane !== tab;
+    setTimeout(() => $(`#team-forms [data-pane="${tab}"] input`)?.focus(), 30);
+  }
+  $('#team-forms').addEventListener('click', (e) => {
+    const tab = e.target.closest('[data-team-tab]');
+    if (tab) setTeamTab(tab.dataset.teamTab);
+  });
+
+  async function loadOpenTeams() {
+    try {
+      const { teams } = await api('GET', '/api/teams/discover');
+      $('#open-teams-section').hidden = !teams.length;
+      $('#open-teams').innerHTML = teams.map((t) => `<li>${teamTile(t, 'md')}<span class="grow"><strong>${esc(t.name)}</strong><small>${t.memberCount} member${t.memberCount === 1 ? '' : 's'}</small></span><button class="btn sm" type="button" data-join-team="${esc(t.id)}">Join</button></li>`).join('');
+    } catch { $('#open-teams-section').hidden = true; }
+  }
+  $('#open-teams').addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-join-team]');
+    if (!b) return;
+    b.disabled = true;
+    try {
+      const { team } = await api('POST', `/api/teams/${encodeURIComponent(b.dataset.joinTeam)}/join`);
+      $('#dlg-team').close();
+      await goToTeam(team, team.lobbyId);
+    } catch (x) {
+      b.disabled = false;
+      $('#form-team-join [data-error]').textContent = x.message;
+    }
+  });
+
+  function showOnboard() {
+    showOnly('onboard');
+    $('#onboard-invite').hidden = true;
+    $('#onboard-main').hidden = false;
+    $('#onboard-me').textContent = `Signed in as ${S.me.name}${S.me.email ? ` (${S.me.email})` : ''}`;
+    moveTeamForms('#onboard-forms', 'create');
+  }
+
+  async function showInvite(code) {
+    showOnly('onboard');
+    $('#onboard-me').textContent = `Signed in as ${S.me.name}${S.me.email ? ` (${S.me.email})` : ''}`;
+    $('#onboard-main').hidden = true;
+    $('#onboard-invite').hidden = false;
+    $('#invite-error').textContent = '';
+    $('#invite-accept').hidden = false;
+    $('#invite-skip').textContent = 'Not now';
+    try {
+      const { team } = await api('GET', `/api/invites/${encodeURIComponent(code)}`);
+      if (team.member) {
+        local.del(KEYS.invite);
+        S.teams.set(team.id, team);
+        return enterApp(team.id);
+      }
+      $('#invite-tile').innerHTML = teamTile(team, 'xl');
+      $('#invite-team-name').textContent = team.name;
+      $('#invite-team-meta').textContent = `${team.memberCount} member${team.memberCount === 1 ? '' : 's'}`;
+      $('#invite-accept').textContent = `Join ${team.name}`;
+      $('#invite-accept').onclick = async () => {
+        $('#invite-accept').disabled = true;
+        try {
+          const { team: joined } = await api('POST', `/api/invites/${encodeURIComponent(code)}`);
+          await goToTeam(joined, joined.lobbyId);
+        } catch (x) {
+          $('#invite-error').textContent = x.message;
+        } finally {
+          $('#invite-accept').disabled = false;
+        }
+      };
+    } catch (x) {
+      $('#invite-tile').innerHTML = '';
+      $('#invite-team-name').textContent = 'This invite doesn’t work';
+      $('#invite-team-meta').textContent = '';
+      $('#invite-error').textContent = x.message;
+      $('#invite-accept').hidden = true;
+      $('#invite-skip').textContent = 'Continue';
+    }
+  }
+  $('#invite-skip').addEventListener('click', () => {
+    local.del(KEYS.invite);
+    if (S.teams.size) enterApp();
+    else showOnboard();
+  });
+  $('#onboard-signout').addEventListener('click', () => signOut());
+
+  wireForm($('#form-team-create'), async (fd) => {
+    const { team } = await api('POST', '/api/teams', { name: fd.get('name'), visibility: fd.get('visibility') });
+    $('#dlg-team').close();
+    await goToTeam(team, team.lobbyId);
+    toast(`Created ${team.name}. Invite people from the team menu.`);
+  });
+  wireForm($('#form-team-join'), async (fd) => {
+    const code = codeFrom(fd.get('code'));
+    if (!code) throw new Error('Paste an invite link');
+    const { team } = await api('POST', `/api/invites/${encodeURIComponent(code)}`);
+    $('#dlg-team').close();
+    await goToTeam(team, team.lobbyId);
+  });
+
+  function openTeamDialog(tab = 'create') {
+    closeMenu();
+    moveTeamForms('#dlg-team-body', tab);
+    $('#app').classList.remove('nav-open');
+    $('#dlg-team').showModal();
+  }
+
+  // ---------- team settings ----------
+  function openTeamSettings() {
+    closeMenu();
+    const t = currentTeam();
+    if (!t) return;
+    const form = $('#form-team-settings');
+    form.reset();
+    form.querySelector('[data-error]').textContent = '';
+    form.elements.name.value = t.name;
+    form.elements.visibility.value = t.visibility;
+    renderTeamSettings();
+    $('#app').classList.remove('nav-open');
+    if (!$('#dlg-team-settings').open) $('#dlg-team-settings').showModal();
+  }
+  function renderTeamSettings() {
+    const t = currentTeam();
+    if (!t) return;
+    const owner = t.role === 'owner';
+    const form = $('#form-team-settings');
+    $('#ts-title').textContent = `${t.name} settings`;
+    for (const el of form.elements) if (el.name) el.disabled = !owner;
+    for (const el of $$('#dlg-team-settings [data-owner-only]')) el.hidden = !owner;
+    $('#ts-link').textContent = inviteUrl(t);
+    const people = [...S.people.values()].sort((a, b) => (b.role === 'owner') - (a.role === 'owner') || a.name.localeCompare(b.name));
+    $('#ts-members-title').textContent = `Members · ${people.length}`;
+    $('#ts-members').innerHTML = people.map((u) => `<li>${avatar({ ...u, kind: 'user', imageUrl: u.id === S.me.id ? S.me.imageUrl : u.imageUrl }, { presence: true })}<span class="grow"><strong>${esc(u.name)}${u.id === S.me.id ? ' <span class="muted">(you)</span>' : ''}</strong><small>@${esc(u.handle)} · ${u.role === 'owner' ? 'Owner' : 'Member'}</small></span>${owner && u.id !== S.me.id ? `<button class="btn sm" type="button" data-team-remove="${esc(u.id)}">Remove</button>` : ''}</li>`).join('');
+    $('#ts-leave').hidden = people.length <= 1;
+  }
+  wireForm($('#form-team-settings'), async (fd) => {
+    const { team } = await api('PATCH', `/api/teams/${encodeURIComponent(S.teamId)}`, { name: fd.get('name'), visibility: fd.get('visibility') });
+    S.teams.set(team.id, { ...currentTeam(), ...team });
+    renderTeamSwitch();
+    renderTeamSettings();
+    toast('Team saved');
+  });
+  $('#ts-reset').addEventListener('click', async () => {
+    if (!confirm('Make a new invite link? The current link stops working.')) return;
+    try {
+      const { team } = await api('POST', `/api/teams/${encodeURIComponent(S.teamId)}/invite`);
+      S.teams.set(team.id, { ...currentTeam(), ...team });
+      renderTeamSettings();
+      toast('New invite link made');
+    } catch (x) { toast(x.message); }
+  });
+  $('#ts-members').addEventListener('click', async (e) => {
+    const b = e.target.closest('[data-team-remove]');
+    if (!b) return;
+    const u = S.people.get(b.dataset.teamRemove);
+    if (!confirm(`Remove ${u?.name || 'them'} from ${currentTeam().name}? They lose access to its rooms and DMs.`)) return;
+    try {
+      await api('DELETE', `/api/teams/${encodeURIComponent(S.teamId)}/members/${encodeURIComponent(b.dataset.teamRemove)}`);
+      S.people.delete(b.dataset.teamRemove);
+      renderTeamSettings();
+      renderSidebar();
+    } catch (x) { toast(x.message); }
+  });
+  $('#ts-leave').addEventListener('click', async () => {
+    const t = currentTeam();
+    if (!confirm(`Leave ${t.name}? You lose access to its rooms and DMs until someone invites you again.`)) return;
+    try {
+      await api('POST', `/api/teams/${encodeURIComponent(t.id)}/leave`);
+      $('#dlg-team-settings').close();
+      leftTeam(t.id, `You left ${t.name}`);
+    } catch (x) { toast(x.message); }
+  });
+  $('#ts-delete').addEventListener('click', async () => {
+    const t = currentTeam();
+    const typed = prompt(`Delete ${t.name} for everyone? Its rooms, DMs and messages are deleted and can’t be recovered.\n\nType the team name to confirm:`);
+    if (typed === null) return;
+    if (typed.trim() !== t.name) return toast('The name didn’t match, so nothing was deleted.');
+    try {
+      await api('DELETE', `/api/teams/${encodeURIComponent(t.id)}`);
+      $('#dlg-team-settings').close();
+      leftTeam(t.id, `Deleted ${t.name}`);
+    } catch (x) { toast(x.message); }
+  });
+
+  /** You are out of a team (left, removed, or it was deleted): drop it and move on. */
+  async function leftTeam(teamId, message) {
+    const t = S.teams.get(teamId);
+    S.teams.delete(teamId);
+    for (const r of teamRooms(teamId)) { S.rooms.delete(r.id); S.msgs.delete(r.id); S.unread.delete(r.id); }
+    if (message || t) toast(message || `You’re no longer in ${t.name}`);
+    try { await loadAgents(); } catch { /* keep the old list */ }
+    if (teamId !== S.teamId) return renderAll();
+    if ($('#dlg-team-settings').open) $('#dlg-team-settings').close();
+    const next = S.teams.keys().next().value;
+    if (!next) {
+      S.teamId = null;
+      S.active = null;
+      S.appReady = false;
+      return showOnboard();
+    }
+    await switchTeam(next);
   }
 
   function renderMe() {
     $('#me-avatar').outerHTML = avatar({ ...S.me, kind: 'user' }).replace('<span class="', '<span id="me-avatar" class="');
     $('#btn-me').title = `${S.me.name} (@${S.me.handle})`;
-    $('#ws-name').textContent = S.config?.name || 'Crosstalk';
   }
 
   async function loadRooms() {
@@ -425,8 +729,14 @@
     S.rooms = new Map(rooms.map((r) => [r.id, r]));
   }
   async function loadPeople() {
-    const { people } = await api('GET', '/api/people');
-    S.people = new Map(people.map((u) => [u.id, u]));
+    if (!S.teamId) { S.people = new Map(); return; }
+    const teamId = S.teamId;
+    const { people } = await api('GET', `/api/teams/${encodeURIComponent(teamId)}/people`);
+    if (teamId === S.teamId) S.people = new Map(people.map((u) => [u.id, u]));
+  }
+  async function loadTeams() {
+    const { teams } = await api('GET', '/api/teams');
+    S.teams = new Map(teams.map((t) => [t.id, t]));
   }
   async function loadAgents() {
     const { agents } = await api('GET', '/api/agents');
@@ -512,8 +822,11 @@
   }
 
   async function resync() {
+    await loadTeams();
+    if (!S.teams.has(S.teamId)) return leftTeam(S.teamId);
     await Promise.all([loadRooms(), loadAgents(), loadPeople()]);
     if (S.active && S.rooms.has(S.active)) await loadMessages(S.active);
+    renderTeamSwitch();
     renderAll();
   }
 
@@ -526,9 +839,37 @@
         if (evt.roomId === S.active) renderMessages({ keep: true });
         return;
       }
+      case 'team': {
+        const known = S.teams.has(evt.team.id);
+        S.teams.set(evt.team.id, { ...S.teams.get(evt.team.id), ...evt.team });
+        if (!S.appReady) return;
+        renderTeamSwitch();
+        if (!known) loadRooms().then(loadAgents).then(renderAll).catch(() => {});
+        if (evt.team.id === S.teamId && $('#dlg-team-settings').open) renderTeamSettings();
+        return;
+      }
+      case 'team_member':
+        if (evt.teamId === S.teamId) {
+          S.people.set(evt.person.id, evt.person);
+          renderSidebar();
+          if (S.panel.mode === 'people') renderPanel();
+          if ($('#dlg-team-settings').open) renderTeamSettings();
+        }
+        loadAgents().then(() => { renderSidebar(); if (S.panel.mode === 'directory') renderPanel(); }).catch(() => {});
+        return;
+      case 'team_member_removed':
+        if (evt.teamId === S.teamId) {
+          S.people.delete(evt.userId);
+          renderAll();
+          if ($('#dlg-team-settings').open) renderTeamSettings();
+        }
+        return;
+      case 'team_removed':
+        if (S.teams.has(evt.teamId)) leftTeam(evt.teamId);
+        return;
       case 'room': {
         const r = evt.room;
-        const visible = r.visibility === 'public' || r.members.some((m) => m.kind === 'user' && m.id === S.me.id);
+        const visible = (!r.teamId || S.teams.has(r.teamId)) && (r.visibility === 'public' || r.members.some((m) => m.kind === 'user' && m.id === S.me.id));
         if (visible) S.rooms.set(r.id, r);
         else S.rooms.delete(r.id);
         renderSidebar();
@@ -547,7 +888,7 @@
         return;
       }
       case 'person':
-        S.people.set(evt.person.id, evt.person);
+        if (S.people.has(evt.person.id)) S.people.set(evt.person.id, { ...S.people.get(evt.person.id), ...evt.person });
         renderSidebar();
         if (S.panel.mode === 'profile') renderPanel();
         return;
@@ -594,12 +935,8 @@
     if (room) room.lastMessageAt = m.createdAt;
     const fromOther = m.sender.id !== S.me.id && m.sender.kind !== 'system';
     const visible = m.roomId === S.active && !document.hidden;
-    if (visible) {
-      renderMessages({ forceBottom: m.sender.id === S.me.id });
-    } else if (room && isJoined(room) && fromOther) {
-      S.unread.set(m.roomId, (S.unread.get(m.roomId) || 0) + 1);
-      if (m.roomId === S.active) renderMessages();
-    }
+    if (!visible && room && isJoined(room) && fromOther) S.unread.set(m.roomId, (S.unread.get(m.roomId) || 0) + 1);
+    if (m.roomId === S.active) renderMessages({ forceBottom: visible && m.sender.id === S.me.id });
     const forMe = fromOther && ((m.mentions || []).includes(S.me.handle) || room?.kind === 'dm');
     if (forMe) {
       if (S.mentions) S.mentions = [{ ...m, room: { id: m.roomId, name: room?.name } }, ...S.mentions].slice(0, 50);
@@ -705,13 +1042,24 @@
     '-',
     { text: 'Sign out', icon: 'logout', danger: true, action: signOut },
   ], { side: 'right' }));
-  $('#ws-switch').addEventListener('click', (e) => openMenu(e.currentTarget, [
-    { label: S.config?.name || 'Crosstalk' },
-    ...createItems(),
-    { text: 'Your agents', icon: 'settings', action: () => openSettings(null) },
-    '-',
-    ...themeItems(),
-  ]));
+  $('#ws-switch').addEventListener('click', (e) => {
+    const t = currentTeam();
+    const teams = [...S.teams.values()].sort((a, b) => (a.joinedAt || 0) - (b.joinedAt || 0));
+    openMenu(e.currentTarget, [
+      { label: 'Your teams' },
+      ...teams.map((x) => {
+        const n = x.id === S.teamId ? 0 : teamUnread(x.id);
+        return { text: x.name, sub: `${x.memberCount} member${x.memberCount === 1 ? '' : 's'}${x.visibility === 'open' ? ' · open' : ''}`, lead: teamTile(x, 'md'), checked: x.id === S.teamId, badge: n ? (n > 99 ? '99+' : String(n)) : '', action: () => x.id !== S.teamId && switchTeam(x.id) };
+      }),
+      { text: 'Create a team', icon: 'plus', action: () => openTeamDialog('create') },
+      { text: 'Join a team', icon: 'link', action: () => openTeamDialog('join') },
+      '-',
+      t ? { label: t.name } : null,
+      t ? { text: 'Invite people', icon: 'mail', action: openInvite } : null,
+      t ? { text: 'Team settings', icon: 'settings', action: openTeamSettings } : null,
+      t ? { text: 'People', icon: 'users', action: () => openPanel('people') } : null,
+    ]);
+  });
   async function signOut() {
     if (Auth.mode === 'dev' && !confirm('Sign out? In development mode this browser forgets the account.')) return;
     await Auth.signOut();
@@ -760,7 +1108,7 @@
     ]);
   });
   function openDirectMessages() {
-    const dms = [...S.rooms.values()].filter((r) => r.kind === 'dm');
+    const dms = teamRooms().filter((r) => r.kind === 'dm');
     const unread = dms.filter((r) => S.unread.get(r.id)).sort((a, b) => (b.lastMessageAt || 0) - (a.lastMessageAt || 0));
     if (unread.length) return openRoom(unread[0].id);
     UI.collapsed.dms = false;
@@ -868,7 +1216,7 @@
       return `<li data-room="${room.id}" class="${room.id === S.active ? 'active' : ''} ${unread ? 'unread' : ''} ${isJoined(room) ? '' : 'unjoined'}" title="${esc(label)}">
         ${lead}<span class="label">${esc(label)}</span>${unread ? `<span class="badge">${unread > 99 ? '99+' : unread}</span>` : ''}</li>`;
     };
-    const rooms = [...S.rooms.values()];
+    const rooms = teamRooms();
     const channels = rooms.filter((r) => r.kind === 'room' && match(r.name, r.topic)).sort((a, b) => isJoined(b) - isJoined(a) || byRecent(a, b));
     $('#room-list').innerHTML =
       channels.map((r) => item(r, r.name, `<span class="room-icon">${icon(r.visibility === 'private' ? 'lock' : 'hash')}</span>`)).join('') +
@@ -888,9 +1236,9 @@
         <button class="icon-btn sm row-act" type="button" data-dm-handle="${esc(u.handle)}" title="Message ${esc(u.name)}" aria-label="Message ${esc(u.name)}">${icon('chat', 'sm')}</button></li>`).join('') +
       (people.length > shown.length ? `<li class="more-row" data-nav-open="people"><span class="room-icon">${icon('users')}</span><span class="label">See all ${people.length} people</span></li>` : '') +
       (f ? (people.length ? '' : '<li class="empty">No matching people</li>')
-        : `${people.length ? '' : '<li class="empty">No one else has joined yet.</li>'}<li class="add-row" data-open="invite"><span class="room-icon">${icon('plus')}</span><span class="label">Invite people</span></li>`);
+        : `${people.length ? '' : `<li class="empty">No one else is in ${esc(currentTeam()?.name || 'this team')} yet.</li>`}<li class="add-row" data-open="invite"><span class="room-icon">${icon('plus')}</span><span class="label">Invite people</span></li>`);
 
-    const agents = [...S.agents.values()].filter((a) => match(a.name, a.handle, a.description)).sort((a, b) => mine(b) - mine(a) || b.online - a.online || a.handle.localeCompare(b.handle));
+    const agents = [...S.agents.values()].filter((a) => inTeamAgent(a) && match(a.name, a.handle, a.description)).sort((a, b) => mine(b) - mine(a) || b.online - a.online || a.handle.localeCompare(b.handle));
     $('#agent-list').innerHTML =
       agents.map((a) => `<li data-agent="${a.id}" title="${esc(`${a.name} (@${a.handle})${a.description ? ` — ${a.description}` : ''}`)}">
         ${avatar(a, { size: 'sm', presence: true })}<span class="label">${esc(a.name)}</span>
@@ -903,7 +1251,8 @@
     $('#nav-dms-badge').textContent = dmUnread > 99 ? '99+' : String(dmUnread);
     updateNavButtons();
     const total = [...S.unread.values()].reduce((n, x) => n + x, 0);
-    document.title = total ? `(${total}) Crosstalk` : 'Crosstalk';
+    document.title = total ? `(${total}) ${currentTeam()?.name || 'Crosstalk'}` : `${currentTeam()?.name ? `${currentTeam().name} · ` : ''}Crosstalk`;
+    renderTeamSwitch();
   }
 
   function renderHeader() {
@@ -1051,7 +1400,7 @@
           ${infoRow('at', `@${esc(a.handle)}`)}
           ${infoRow('user', a.owner ? `Owned by <a href="#" data-profile="user:${a.owner.id}">${esc(a.owner.name)}</a>` : 'No owner')}
           ${infoRow('cpu', esc(runtimeLabel(a.runtime)))}
-          ${infoRow('eye', a.visibility === 'public' ? 'Anyone on this hub can talk to it' : 'Only its owner can talk to it')}
+          ${infoRow('eye', a.visibility === 'public' ? 'Anyone in its owner’s teams can talk to it' : 'Only its owner can talk to it')}
           ${infoRow('shield', mine(a) ? 'You’re its owner: it acts on your requests' : 'You’re a guest: it chats, but won’t act on its computer for you')}
           ${mine(a) && b ? infoRow('monitor', `${esc(b.host || '?')}<small>${esc(b.cwd || '')}</small>`) : ''}
           ${infoRow('calendar', `Added ${esc(fmtDate(a.createdAt))}`)}
@@ -1103,7 +1452,7 @@
       title.textContent = 'Mentions & replies';
       const list = S.mentions;
       body.innerHTML = !list ? '<p class="muted">Loading…</p>' : list.length
-        ? list.map((m) => `<div class="result" data-open-room="${m.roomId}" data-jump-id="${m.id}"><div class="top">${avatar(senderOf(m), { size: 'xs' })}<strong>${esc(m.sender.name)}</strong><span class="muted">in ${esc(S.rooms.get(m.roomId) ? (S.rooms.get(m.roomId).kind === 'dm' ? roomTitle(S.rooms.get(m.roomId)) : `#${m.room?.name || S.rooms.get(m.roomId).name}`) : m.room?.name || '')}</span>${timeEl(m.createdAt)}</div><div class="txt">${esc(snippet(m.text, 220))}</div></div>`).join('')
+        ? list.map((m) => `<div class="result" data-open-room="${m.roomId}" data-jump-id="${m.id}"><div class="top">${avatar(senderOf(m), { size: 'xs' })}<strong>${esc(m.sender.name)}</strong><span class="muted">in ${esc(S.rooms.get(m.roomId) ? (S.rooms.get(m.roomId).kind === 'dm' ? roomTitle(S.rooms.get(m.roomId)) : `#${m.room?.name || S.rooms.get(m.roomId).name}`) : m.room?.name || '')}${m.room?.teamId && m.room.teamId !== S.teamId && S.teams.get(m.room.teamId) ? ` · ${esc(S.teams.get(m.room.teamId).name)}` : ''}</span>${timeEl(m.createdAt)}</div><div class="txt">${esc(snippet(m.text, 220))}</div></div>`).join('')
         : '<div class="empty-room" style="margin:30px auto"><p>When someone @mentions you, or an agent answers you in a direct message, it shows up here.</p></div>';
       return;
     }
@@ -1114,7 +1463,7 @@
       const list = [...S.people.values()].filter((u) => !q || [u.name, u.handle].some((x) => String(x || '').toLowerCase().includes(q))).sort((a, b) => (b.id === S.me.id) - (a.id === S.me.id) || (b.online ? 1 : 0) - (a.online ? 1 : 0) || a.name.localeCompare(b.name));
       body.innerHTML = `<form class="panel-search" id="people-form"><input id="people-input" type="search" placeholder="Find a person…" value="${esc(S.peopleQuery || '')}" autocomplete="off"></form>
         <div>${list.map((u) => `<div class="row click" data-profile="user:${u.id}">${avatar({ ...u, kind: 'user', imageUrl: u.id === S.me.id ? S.me.imageUrl : u.imageUrl }, { size: 'sm', presence: true })}<span class="grow"><strong>${esc(u.name)}${u.id === S.me.id ? ' <span class="muted">(you)</span>' : ''}</strong><small>@${esc(u.handle)} · ${u.id === S.me.id || u.online ? 'online' : 'offline'}</small></span>${u.id === S.me.id ? '' : `<button class="btn sm" type="button" data-dm-handle="${esc(u.handle)}">Message</button>`}</div>`).join('')}
-        ${list.length <= 1 && !q ? '<p class="muted small">No one else has joined this hub yet. Invite people and they’ll show up here.</p>' : ''}</div>`;
+        ${list.length <= 1 && !q ? `<p class="muted small">No one else is in ${esc(currentTeam()?.name || 'this team')} yet. Invite people and they’ll show up here.</p>` : ''}</div>`;
       foot.innerHTML = `<button class="solid" type="button" data-open="invite">${icon('plus', 'sm')}Invite people</button>`;
       return;
     }
@@ -1122,7 +1471,7 @@
     if (mode === 'directory') {
       title.textContent = 'Agent directory';
       const q = (S.dirQuery || '').toLowerCase();
-      const list = [...S.agents.values()].filter((a) => !q || [a.name, a.handle, a.description, a.owner?.name].some((x) => String(x || '').toLowerCase().includes(q))).sort((a, b) => b.online - a.online || a.name.localeCompare(b.name));
+      const list = [...S.agents.values()].filter(inTeamAgent).filter((a) => !q || [a.name, a.handle, a.description, a.owner?.name].some((x) => String(x || '').toLowerCase().includes(q))).sort((a, b) => b.online - a.online || a.name.localeCompare(b.name));
       body.innerHTML = `<form class="panel-search" id="dir-form"><input id="dir-input" type="search" placeholder="Find an agent…" value="${esc(S.dirQuery || '')}" autocomplete="off"></form>
         <div>${list.map((a) => `<div class="row click" data-profile="agent:${a.id}">${avatar(a, { size: 'sm', presence: true })}<span class="grow"><strong>${esc(a.name)}</strong><small>@${esc(a.handle)} · ${runtimeLabel(a.runtime)}${a.owner ? ` · ${esc(a.owner.name)}` : ''}${a.description ? ` · ${esc(a.description)}` : ''}</small></span></div>`).join('') || '<p class="muted">No agents yet.</p>'}</div>`;
       foot.innerHTML = `<button class="solid" type="button" data-open="connect">${icon('plus', 'sm')}Connect your agent</button>`;
@@ -1142,7 +1491,7 @@
     body.innerHTML = `<div class="p-section"><h4>About ${room.createdBy === S.me.id ? '<button class="link-btn" type="button" data-open="edit-room">Edit</button>' : ''}</h4>
         <p>${esc(room.topic || 'No topic yet.')}</p></div>
       <ul class="info">
-        ${infoRow(room.visibility === 'private' ? 'lock' : 'eye', room.visibility === 'private' ? 'Invite only' : 'Anyone on this hub can join')}
+        ${infoRow(room.visibility === 'private' ? 'lock' : 'eye', room.visibility === 'private' ? 'Invite only' : `Anyone in ${esc(S.teams.get(room.teamId)?.name || 'the team')} can join`)}
         ${creator ? infoRow('user', `Created by <a href="#" data-profile="user:${creator.id}">${esc(memberName(creator))}</a>`) : ''}
         ${infoRow('calendar', `Created ${esc(fmtDate(room.createdAt))}`)}
       </ul>
@@ -1158,10 +1507,12 @@
   // ---------- rooms ----------
   async function openRoom(id) {
     if (!S.rooms.has(id)) return;
+    const teamId = S.rooms.get(id).teamId;
+    if (teamId && teamId !== S.teamId && S.teams.has(teamId)) await setTeam(teamId);
     const changed = S.active !== id;
     S.active = id;
     recordVisit(id);
-    local.set(KEYS.room, id);
+    local.set(`${KEYS.room}.${S.teamId}`, id);
     S.unread.delete(id);
     if (changed) {
       setReply(null);
@@ -1183,8 +1534,10 @@
   }
 
   function openFallback() {
-    const general = [...S.rooms.values()].find((r) => r.slug === 'general') || S.rooms.values().next().value;
-    if (general) openRoom(general.id);
+    const lobby = lobbyRoom();
+    if (lobby) return openRoom(lobby.id);
+    S.active = null;
+    renderAll();
   }
 
   async function jumpTo(messageId) {
@@ -1414,7 +1767,7 @@
       out.push({ ...e, inRoom });
     };
     room?.members.filter((m) => m.kind === 'agent').forEach((m) => push(agentOf(m), true));
-    [...S.agents.values()].forEach((a) => push(a, false));
+    [...S.agents.values()].filter(inTeamAgent).forEach((a) => push(a, false));
     room?.members.filter((m) => m.kind === 'user').forEach((m) => push(m, true));
     return out.filter((e) => e.handle.startsWith(q) || e.name.toLowerCase().includes(q)).slice(0, 8);
   }
@@ -1492,7 +1845,7 @@
     if (dmHandle) {
       e.stopPropagation();
       try {
-        const { room } = await api('POST', '/api/dm', { handle: dmHandle.dataset.dmHandle });
+        const { room } = await api('POST', '/api/dm', { handle: dmHandle.dataset.dmHandle, teamId: S.teamId });
         S.rooms.set(room.id, room);
         if (!wideQuery.matches && dmHandle.closest('#panel')) setPanelOpen(false);
         return openRoom(room.id);
@@ -1535,7 +1888,7 @@
       const h = pact.dataset.handle;
       try {
         if (pact.dataset.pact === 'dm') {
-          const { room } = await api('POST', '/api/dm', { handle: h });
+          const { room } = await api('POST', '/api/dm', { handle: h, teamId: S.teamId });
           S.rooms.set(room.id, room);
           return openRoom(room.id);
         }
@@ -1640,7 +1993,7 @@
       $('#dlg-room').close();
       return renderAll();
     }
-    const { room } = await api('POST', '/api/rooms', fields);
+    const { room } = await api('POST', '/api/rooms', { ...fields, teamId: S.teamId });
     S.rooms.set(room.id, room);
     $('#dlg-room').close();
     openRoom(room.id);
@@ -1673,14 +2026,14 @@
     const q = $('#member-search').value.trim().toLowerCase();
     const inRoom = new Set(room.members.map((m) => m.id));
     const addBtn = (h) => ({ button: `<button class="btn sm" type="button" data-add="${esc(h)}">Add</button>` });
-    const agents = [...S.agents.values()].filter((a) => !inRoom.has(a.id) && matches(q, a.name, a.handle, a.description));
+    const agents = [...S.agents.values()].filter((a) => inTeamAgent(a) && !inRoom.has(a.id) && matches(q, a.name, a.handle, a.description));
     const yours = agents.filter(mine).map((a) => agentRow(a, addBtn(a.handle)));
     const others = agents.filter((a) => !mine(a)).sort((a, b) => b.online - a.online).map((a) => agentRow(a, addBtn(a.handle)));
     const people = [...S.people.values()].filter((u) => !inRoom.has(u.id) && matches(q, u.name, u.handle)).map((u) => personRow(u, addBtn(u.handle)));
     const html = group('Your agents', yours) + group('People', people) + group('Other agents', others);
     const nobodyElse = [...S.people.values()].every((u) => u.id === S.me.id);
     $('#member-picker').innerHTML = (html || `<p class="empty-note">${q ? 'No one matches. You can also type an exact @handle below.' : 'Everyone you can add is already here.'}</p>`) +
-      (nobodyElse && !q ? `<p class="empty-note">No one else has joined this hub yet. <button class="link-btn" type="button" data-open="invite">Invite people</button> and they’ll appear here to add.</p>` : '');
+      (nobodyElse && !q ? `<p class="empty-note">No one else is in this team yet. <button class="link-btn" type="button" data-open="invite">Invite people</button> and they’ll appear here to add.</p>` : '');
   }
   function openAddMember() {
     const room = S.rooms.get(S.active);
@@ -1697,18 +2050,21 @@
   function renderDmPicker() {
     const q = $('#dm-search').value.trim().toLowerCase();
     const people = [...S.people.values()].filter((u) => u.id !== S.me.id && matches(q, u.name, u.handle)).map((u) => personRow(u, { click: 'dm-to' }));
-    const agents = [...S.agents.values()].filter((a) => matches(q, a.name, a.handle, a.description)).sort((a, b) => mine(b) - mine(a) || b.online - a.online).map((a) => agentRow(a, { click: 'dm-to' }));
-    $('#dm-picker').innerHTML = (group('People', people) || (q ? '' : `<section><h3>People</h3><p class="empty-note">No one else has joined this hub yet. <button class="link-btn" type="button" data-open="invite">Invite people</button></p></section>`)) +
+    const agents = [...S.agents.values()].filter((a) => inTeamAgent(a) && matches(q, a.name, a.handle, a.description)).sort((a, b) => mine(b) - mine(a) || b.online - a.online).map((a) => agentRow(a, { click: 'dm-to' }));
+    $('#dm-picker').innerHTML = (group('People', people) || (q ? '' : `<section><h3>People</h3><p class="empty-note">No one else is in this team yet. <button class="link-btn" type="button" data-open="invite">Invite people</button></p></section>`)) +
       group('Agents', agents) || '<p class="empty-note">No one matches.</p>';
   }
   function openInvite() {
     closeMenu();
     $('#dlg-dm').close();
     $('#dlg-member').close();
-    const link = location.origin;
+    const t = currentTeam();
+    if (!t) return;
+    const link = inviteUrl(t);
     const local = /^(localhost|127\.|0\.0\.0\.0|\[::1\])/.test(location.hostname);
+    $('#invite-title').textContent = `Invite people to ${t.name}`;
     $('#invite-link').textContent = link;
-    $('#invite-text').value = `Join me on Crosstalk, where people and AI agents talk to each other: ${link}\nSign in with Google, then find me under People (@${S.me.handle}).`;
+    $('#invite-text').value = `Join ${t.name} on Crosstalk, where people and AI agents talk to each other: ${link}\nSign in with Google and you’re in. I’m @${S.me.handle}.`;
     $('#invite-local').hidden = !local;
     $('#invite-local').innerHTML = local
       ? '<strong>This link only works on your computer.</strong> The hub runs at localhost, so other people can’t open it yet. To invite them, put the hub online (see “Deploy” in the README), or share it temporarily with a tunnel such as <code>cloudflared tunnel --url ${esc(location.origin)}</code> and add that address to <code>CLERK_AUTHORIZED_PARTIES</code> in the hub’s <code>.env</code>.'
@@ -1738,7 +2094,7 @@
     const li = e.target.closest('[data-dm-to]');
     if (!li) return;
     try {
-      const { room } = await api('POST', '/api/dm', { handle: li.dataset.dmTo });
+      const { room } = await api('POST', '/api/dm', { handle: li.dataset.dmTo, teamId: S.teamId });
       S.rooms.set(room.id, room);
       $('#dlg-dm').close();
       openRoom(room.id);
@@ -1979,7 +2335,7 @@
     main.innerHTML = `
       <div class="card settings-head">
         ${avatar(a, { size: 'lg', presence: true })}
-        <div class="grow"><h2>${esc(a.name)} <span class="tag">${runtimeLabel(a.runtime)}</span></h2><span class="muted">@${esc(a.handle)} · ${a.visibility === 'public' ? 'anyone on this hub can talk to it' : 'only you can talk to it'}</span></div>
+        <div class="grow"><h2>${esc(a.name)} <span class="tag">${runtimeLabel(a.runtime)}</span></h2><span class="muted">@${esc(a.handle)} · ${a.visibility === 'public' ? 'people in your teams can talk to it' : 'only you can talk to it'}</span></div>
         <button class="btn sm" type="button" data-settings-act="copy-handle">Copy handle</button>
       </div>
       ${a.setupDone ? '' : `<div class="banner warn"><strong>Setup not finished.</strong> Under Connections, create a connect prompt and paste it into your AI agent. It comes online here when it’s done.</div>`}
@@ -1999,7 +2355,7 @@
         <label>What it’s good at<input name="description" maxlength="280" value="${esc(a.description || '')}"></label>
         <div class="two">
           <label>Runtime<select name="runtime">${[['claude-code', 'Claude Code'], ['codex', 'Codex'], ['other', 'Other CLI or script']].map(([v, l]) => `<option value="${v}" ${a.runtime === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
-          <label>Who can talk to it<select name="visibility"><option value="public" ${a.visibility === 'public' ? 'selected' : ''}>Anyone on this hub</option><option value="private" ${a.visibility === 'private' ? 'selected' : ''}>Only me</option></select></label>
+          <label>Who can talk to it<select name="visibility"><option value="public" ${a.visibility === 'public' ? 'selected' : ''}>People in my teams</option><option value="private" ${a.visibility === 'private' ? 'selected' : ''}>Only me</option></select></label>
         </div>
         <div><button class="btn" type="submit">Save</button> <span class="muted small" data-saved></span></div>
       </form>

@@ -180,7 +180,24 @@ export function createServer({ config, clerk = null, log = defaultLogger(config?
   route('GET', '/api/me', ({ p }) => hub.me(p));
   route('PATCH', '/api/me', ({ p, body }) => hub.updateMe(p, body));
 
-  route('GET', '/api/agents', ({ p }) => ({ agents: hub.listAgents(p) }));
+  route('GET', '/api/teams', ({ p }) => ({ teams: hub.listTeams(p) }));
+  route('GET', '/api/teams/discover', ({ p }) => ({ teams: hub.discoverTeams(p) }));
+  route('POST', '/api/teams', ({ p, body }) => ({ team: hub.createTeam(p, body) }));
+  route('PATCH', '/api/teams/:id', ({ p, params, body }) => ({ team: hub.updateTeam(p, params.id, body) }));
+  route('DELETE', '/api/teams/:id', ({ p, params }) => (hub.deleteTeam(p, params.id), { ok: true }));
+  route('POST', '/api/teams/:id/join', ({ p, params }) => ({ team: hub.joinTeam(p, params.id) }));
+  route('POST', '/api/teams/:id/leave', ({ p, params }) => (hub.leaveTeam(p, params.id), { ok: true }));
+  route('POST', '/api/teams/:id/invite', ({ p, params }) => ({ team: hub.resetTeamInvite(p, params.id) }));
+  route('GET', '/api/teams/:id/people', ({ p, params }) => ({ people: hub.listPeople(p, params.id) }));
+  route('DELETE', '/api/teams/:id/members/:uid', ({ p, params }) => (hub.removeFromTeam(p, params.id, params.uid), { ok: true }));
+  // Invite links (/join/<code>). Codes are long and random, but guesses are still limited.
+  const inviteLimit = (req) => {
+    if (limited(`invite:${clientIp(req)}`, 30, 10 * 60_000)) throw new HubError(429, 'Too many invite links tried. Wait a few minutes and try again.');
+  };
+  route('GET', '/api/invites/:code', ({ p, params, req }) => (inviteLimit(req), { team: hub.previewInvite(p, params.code) }));
+  route('POST', '/api/invites/:code', ({ p, params, req }) => (inviteLimit(req), { team: hub.joinByCode(p, params.code) }));
+
+  route('GET', '/api/agents', ({ p, query }) => ({ agents: hub.listAgents(p, { teamId: query.get('team') || undefined }) }));
   route('POST', '/api/agents', ({ p, body }) => hub.createAgent(p, body));
   route('GET', '/api/agents/:id', ({ p, params }) => ({ agent: hub.getAgent(p, params.id) }));
   route('PATCH', '/api/agents/:id', ({ p, params, body }) => ({ agent: hub.updateAgent(p, params.id, body) }));
@@ -214,8 +231,7 @@ export function createServer({ config, clerk = null, log = defaultLogger(config?
     return hub.postMessage(p, params.id, body);
   });
   route('DELETE', '/api/messages/:id', ({ p, params }) => (hub.deleteMessage(p, params.id), { ok: true }));
-  route('POST', '/api/dm', ({ p, body }) => ({ room: hub.openDM(p, body.handle) }));
-  route('GET', '/api/people', ({ p }) => ({ people: hub.listPeople(p) }));
+  route('POST', '/api/dm', ({ p, body }) => ({ room: hub.openDM(p, body.handle, body.teamId) }));
   route('GET', '/api/messages/:id/reply', async ({ p, params, query, signal }) => ({
     reply: await hub.waitForReply(p, params.id, { from: query.get('from'), timeoutMs: clamp(num(query.get('wait')) ?? 30, 0, 120) * 1000, signal }),
   }));

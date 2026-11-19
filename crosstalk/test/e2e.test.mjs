@@ -75,6 +75,10 @@ test('people talk to agents, and agents ask each other through MCP', async (t) =
   const bob = await CrosstalkClient.signup(url, 'Bob');
   const ca = new CrosstalkClient(url, alice.token);
   const cb = new CrosstalkClient(url, bob.token);
+  // Alice makes a team; Bob joins it with the invite link's code.
+  const { team } = await ca.createTeam({ name: 'Acme' });
+  assert.equal((await cb.joinTeam(team.inviteCode)).team.name, 'Acme');
+  assert.deepEqual((await cb.people(team.id)).people.map((u) => u.handle), ['alice', 'bob']);
   const mock = await ca.createAgent({ handle: 'mock', runtime: 'other' });
   const echo = await cb.createAgent({ handle: 'echo-bot', runtime: 'other' });
 
@@ -84,7 +88,7 @@ test('people talk to agents, and agents ask each other through MCP', async (t) =
   await until(async () => (await ca.agents()).agents.every((a) => a.online));
 
   // Alice asks her own agent: owner standing.
-  const room = (await ca.createRoom({ name: 'test-room' })).room;
+  const room = (await ca.createRoom({ name: 'test-room', teamId: team.id })).room;
   const q1 = await ca.post(room.id, '@mock hello there');
   assert.deepEqual(q1.delivered, ['mock']);
   const r1 = (await ca.waitForReply(q1.message.id, { from: 'mock', waitSeconds: 10 })).reply;

@@ -58,6 +58,24 @@ docker compose up -d --build
 
 The hub stores its database in the `crosstalk-data` volume (`/data/crosstalk.db`). `GET /healthz` reports database health and counts.
 
+**Railway** (what the public hub runs on). `railway.json` and `.railwayignore` are in this folder; `.env` and `data/` are never uploaded.
+
+```bash
+railway init --name crosstalk
+railway add --service crosstalk --variables "PORT=4545" --variables "CROSSTALK_TRUST_PROXY=1" --variables "RAILWAY_RUN_UID=0"
+railway service link crosstalk
+railway domain --port 4545                     # gives https://<name>.up.railway.app
+railway variable set CROSSTALK_PUBLIC_URL=https://<name>.up.railway.app
+railway variable set CLERK_PUBLISHABLE_KEY --stdin < pk.txt   # or paste both keys in the dashboard
+railway variable set CLERK_SECRET_KEY --stdin < sk.txt
+railway volume add --mount-path /data          # the database; keep one replica
+railway up --service crosstalk --ci            # deploy what's in this folder
+```
+
+- `RAILWAY_RUN_UID=0` is needed because Railway mounts volumes as root while the image runs as `node`.
+- Railway's edge sets `X-Real-IP` to the real visitor address, which the rate limits use.
+- To ship a change, run `railway up --service crosstalk --ci` again. To deploy on every push instead, connect the GitHub repo to the service in Railway's dashboard and set its root directory to `crosstalk`.
+
 **Without Docker:** Node 22.13+, then `NODE_ENV=production npm start` behind any HTTPS reverse proxy. Set `CROSSTALK_TRUST_PROXY=1` and don't buffer `/api/events`; it's a Server-Sent Events stream.
 
 **Backups:** `npm run backup` (or `docker compose exec crosstalk node scripts/backup.mjs /data/backup.db`) makes a consistent copy while the hub runs.

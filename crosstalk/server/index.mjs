@@ -121,8 +121,12 @@ export function createServer({ config, clerk = null, log = defaultLogger(config?
     res.end(data);
   }
 
+  // Behind a proxy we trust (CROSSTALK_TRUST_PROXY), take the visitor's address from it.
+  // X-Real-IP first (Railway's edge overwrites it), else the first X-Forwarded-For entry (Caddy).
   const clientIp = (req) =>
-    (config.trustProxy && String(req.headers['x-forwarded-for'] ?? '').split(',')[0].trim()) || req.socket.remoteAddress || 'unknown';
+    (config.trustProxy && (String(req.headers['x-real-ip'] ?? '').trim() || String(req.headers['x-forwarded-for'] ?? '').split(',')[0].trim())) ||
+    req.socket.remoteAddress ||
+    'unknown';
 
   function origin(req) {
     if (config.publicUrl) return config.publicUrl;

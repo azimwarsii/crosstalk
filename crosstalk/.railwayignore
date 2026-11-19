@@ -1,0 +1,7 @@
+# Never upload local secrets or the local database to Railway.
+.env
+data
+*.db
+*.db-*
+node_modules
+test

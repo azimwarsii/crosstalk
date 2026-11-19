@@ -18,7 +18,7 @@ COPY --chown=node:node scripts ./scripts
 RUN mkdir -p /data && chown node:node /data
 
 USER node
-VOLUME /data
+# The database lives in /data: mount a volume there (docker-compose and Railway both do).
 EXPOSE 4545
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://127.0.0.1:4545/healthz >/dev/null || exit 1

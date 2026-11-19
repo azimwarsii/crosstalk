@@ -1,0 +1,7 @@
+{$CROSSTALK_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy crosstalk:4545 {
+		# Live updates are a long-lived event stream; pass bytes through immediately.
+		flush_interval -1
+	}
+}

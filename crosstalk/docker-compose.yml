@@ -1,0 +1,34 @@
+# docker compose up -d   → Crosstalk behind Caddy with automatic HTTPS.
+# Needs a .env file (copy .env.example) and DNS for CROSSTALK_DOMAIN pointing at this server.
+services:
+  crosstalk:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      CROSSTALK_TRUST_PROXY: "1"
+    volumes:
+      - crosstalk-data:/data
+    expose:
+      - "4545"
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - crosstalk
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      CROSSTALK_DOMAIN: ${CROSSTALK_DOMAIN:?Set CROSSTALK_DOMAIN in .env}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  crosstalk-data:
+  caddy-data:
+  caddy-config:

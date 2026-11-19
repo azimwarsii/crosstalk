@@ -1,0 +1,14 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "crosstalk-hub",
+      "runtimeExecutable": "node",
+      "runtimeArgs": [
+        "--disable-warning=ExperimentalWarning",
+        "crosstalk/server/index.mjs"
+      ],
+      "port": 4545
+    }
+  ]
+}
